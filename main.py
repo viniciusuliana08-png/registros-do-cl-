@@ -482,6 +482,43 @@ async def on_command_error(ctx, error):
 
 # --- 7. COMANDOS ---
 
+@bot.command(name="ajuda", aliases=["help"])
+async def ajuda(ctx):
+    """Exibe a lista explicativa de todos os comandos do bot."""
+    embed = discord.Embed(
+        title="📖 Central de Ajuda — Bot do Clã",
+        description="Confira abaixo a lista detalhada de todos os comandos disponíveis organizados por categoria:",
+        color=0x3498DB
+    )
+
+    embed.add_field(
+        name="👤 Comandos de Membros",
+        value=(
+            "• `!vincular [NICK]` — Vincula um Nick do jogo a uma conta do Discord.\n"
+            "• `!vinculados` — Lista todas as contas do jogo vinculadas a membros do Discord.\n"
+            "• `!pendentes` *(ou `!naovinculados`)* — Lista os membros do clã no jogo que ainda **NÃO** se vincularam.\n"
+            "• `!membros` — Gera um relatório momentâneo da lista e status de atividade dos membros.\n"
+            "• `!ajuda` — Exibe este painel explicativo de comandos."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛡️ Comandos de Administração",
+        value=(
+            "• `!setcla TAG` — Define a TAG exata do clã para este servidor do Discord.\n"
+            "• `!painel` — Cria o painel fixo de organização do clã (auto-atualiza a cada 1 hora).\n"
+            "• `!painelonline` — Cria o painel de atividade recente dos membros (auto-atualiza a cada 5 minutos).\n"
+            "• `!setausentes #canal` — Define o canal onde serão enviados os alertas de membros inativos (+30 dias).\n"
+            "• `!removerausentes` — Desativa os alertas automáticos do canal de ausentes.\n"
+            "• `!desvincular @membro` — Remove manualmente o vínculo de um usuário do banco de dados."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Todos os dados são salvos em nuvem permanentemente no MongoDB Atlas.")
+    await ctx.send(embed=embed)
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setcla(ctx, tag: str):
@@ -502,6 +539,7 @@ async def setcla(ctx, tag: str):
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
             "• `!vinculados` ➔ Lista todas as contas vinculadas.\n"
             "• `!pendentes` ➔ Lista quem falta se vincular.\n"
+            "• `!ajuda` ➔ Exibe o painel explicativo completo de comandos.\n"
             "• `!desvincular @membro` ➔ Remove vinculação."
         ),
         inline=False
@@ -568,22 +606,22 @@ async def painelonline(ctx):
 
 @bot.command()
 async def vincular(ctx, *, nick_jogo: str = None):
-    """Vincular nick do WOTB ao Discord sem risco de travamento."""
+    """Vincula uma conta do jogo perguntando de quem é a conta no Discord."""
     config = await get_server_config(ctx.guild.id)
     if not config or not config.get('clan_tag'):
         await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
         return
 
-    if not nick_jogo:
-        def check_author(m):
-            return m.author == ctx.author and m.channel == ctx.channel
+    def check_author(m):
+        return m.author == ctx.author and m.channel == ctx.channel
 
-        await ctx.send("🎮 **Qual é o seu Nick no WOTB?** *(Responda nesta conversa em até 30 segundos)*")
+    if not nick_jogo:
+        await ctx.send("🎮 **Qual é o Nick no WOTB que você deseja vincular?** *(Responda nesta conversa em até 30 segundos)*")
         try:
             msg_game = await bot.wait_for('message', check=check_author, timeout=30.0)
             nick_jogo = msg_game.content.strip()
         except asyncio.TimeoutError:
-            await ctx.send("⏰ **Tempo esgotado!** Digite `!vincular SEU_NICK` diretamente.")
+            await ctx.send("⏰ **Tempo esgotado!** Digite `!vincular NICK` novamente.")
             return
 
     search_nick = nick_jogo.lower()
@@ -606,8 +644,38 @@ async def vincular(ctx, *, nick_jogo: str = None):
     acc_id = selected_player['account_id']
     real_game_nick = selected_player['account_name']
 
-    await set_mapping(acc_id, real_game_nick, ctx.author.id, str(ctx.author))
-    await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {ctx.author.mention}")
+    # Pergunta de quem é essa conta no Discord
+    await ctx.send(
+        f"🎯 Encontrado: **{real_game_nick}**!\n"
+        f"💬 **Quem é o dono dessa conta no Discord?**\n"
+        f"*(Mencione a pessoa ex: `@Fulano`, ou digite `eu` se for sua própria conta)*"
+    )
+
+    try:
+        msg_discord = await bot.wait_for('message', check=check_author, timeout=30.0)
+        content = msg_discord.content.strip()
+
+        target_member = None
+        if msg_discord.mentions:
+            target_member = msg_discord.mentions[0]
+        elif content.lower() in ['eu', 'me', 'minha', 'mim']:
+            target_member = ctx.author
+        else:
+            # Tenta buscar pelo nome/apelido digitado
+            target_member = discord.utils.find(
+                lambda m: content.lower() in m.name.lower() or (m.nick and content.lower() in m.nick.lower()),
+                ctx.guild.members
+            )
+
+        if not target_member:
+            await ctx.send("❌ **Não consegui encontrar esse membro no Discord.** Vinculação cancelada.")
+            return
+
+        await set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
+        await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
+
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ **Tempo esgotado!** Vinculação cancelada.")
 
 @bot.command(name="pendentes", aliases=["naovinculados"])
 async def pendentes(ctx):
