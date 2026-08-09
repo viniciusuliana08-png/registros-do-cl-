@@ -90,7 +90,7 @@ async def fetch_clan_members():
         for reg in regions:
             url = f"{reg}/wotb/clans/list/?application_id={APPLICATION_ID}&search={CLAN_SEARCH}"
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data.get('data'):
@@ -105,7 +105,7 @@ async def fetch_clan_members():
             
         clan_info_url = f"{base_url}/wotb/clans/info/?application_id={APPLICATION_ID}&clan_id={clan_id}&extra=members"
         try:
-            async with session.get(clan_info_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(clan_info_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     clan_data = data.get('data', {}).get(str(clan_id), {})
@@ -158,7 +158,7 @@ async def vincular(ctx, member: discord.Member, *, nickname_jogo: str):
         for reg in regions:
             url = f"{reg}/wotb/account/list/?application_id={APPLICATION_ID}&search={nickname_jogo}"
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data.get('data'):
@@ -185,7 +185,11 @@ async def desvincular(ctx, member: discord.Member):
 async def membros(ctx):
     loading_msg = await ctx.send("🔄 Sincronizando dados com a Wargaming...")
     
-    tag, in_game_members = await fetch_clan_members()
+    try:
+        tag, in_game_members = await fetch_clan_members()
+    except Exception as e:
+        await loading_msg.edit(content=f"❌ Erro ao conectar à API: {e}")
+        return
     
     if not in_game_members:
         await loading_msg.edit(content="❌ Não foi possível obter os dados do clã no momento.")
@@ -205,23 +209,37 @@ async def membros(ctx):
             d_info = mappings[acc_id]
             em_ambos.append(f"• **{acc_name}** ➔ <@{d_info['discord_id']}> | 🕒 *{last_b}*")
         else:
-            apenas_jogo.append(f"• **{acc_name}** | 🕒 *Última batalha: {last_b}*")
+            apenas_jogo.append(f"• **{acc_name}** | 🕒 *{last_b}*")
             
     embed = discord.Embed(
         title=f"📋 Organização do Clã [{tag}]",
-        description=f"Total de Membros no Jogo: **{len(in_game_members)}**\nVinculados no Discord: **{len(em_ambos)}** | Pendentes: **{len(apenas_jogo)}**",
+        description=f"Total no Jogo: **{len(in_game_members)}** | Vinculados: **{len(em_ambos)}** | Pendentes: **{len(apenas_jogo)}**",
         color=0x3498DB
     )
     
-    txt_ambos = "\n".join(em_ambos) if em_ambos else "Nenhum membro vinculado ainda."
-    if len(txt_ambos) > 1024:
-        txt_ambos = txt_ambos[:1000] + "\n... (lista truncada por tamanho)"
-    embed.add_field(name="🟢 Presentes no Jogo E no Discord", value=txt_ambos, inline=False)
-    
-    txt_jogo = "\n".join(apenas_jogo) if apenas_jogo else "Todos os membros estão no Discord! 🎉"
-    if len(txt_jogo) > 1024:
-        txt_jogo = txt_jogo[:1000] + "\n... (lista truncada por tamanho)"
-    embed.add_field(name="🔴 Apenas no Clã do Jogo (Falta vincular/entrar)", value=txt_jogo, inline=False)
+    # Função para fatiar o texto com segurança em blocos de até 1000 caracteres
+    def add_safe_fields(embed_obj, title, item_list):
+        if not item_list:
+            embed_obj.add_field(name=title, value="Nenhum membro.", inline=False)
+            return
+            
+        current_text = ""
+        part = 1
+        for item in item_list:
+            if len(current_text) + len(item) + 1 > 950:
+                field_title = f"{title} (Parte {part})" if part > 1 else title
+                embed_obj.add_field(name=field_title, value=current_text, inline=False)
+                current_text = item + "\n"
+                part += 1
+            else:
+                current_text += item + "\n"
+                
+        if current_text:
+            field_title = f"{title} (Parte {part})" if part > 1 else title
+            embed_obj.add_field(name=field_title, value=current_text, inline=False)
+
+    add_safe_fields(embed, "🟢 Presentes no Jogo E no Discord", em_ambos)
+    add_safe_fields(embed, "🔴 Apenas no Clã do Jogo", apenas_jogo)
     
     embed.set_footer(text="Lista ordenada pelos jogadores com atividade recente.")
     await loading_msg.edit(content="", embed=embed)
