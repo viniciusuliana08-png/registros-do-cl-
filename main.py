@@ -133,6 +133,7 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.remove_command("help")  # Remove o comando de ajuda padrão para não causar conflito
 
 def get_role_info(role: str):
     if not role:
