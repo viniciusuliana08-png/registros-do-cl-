@@ -468,8 +468,17 @@ async def on_ready():
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
+        
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ **Parâmetro ausente!** Uso correto: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
+        return
+
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("⚠️ Você precisa de permissão de **Administrador** para usar este comando.")
+        return
+
     print(f"Erro no comando {ctx.command}: {error}")
-    await ctx.send("⚠️ **Ocorreu um erro ao processar o comando.** Tente novamente.")
+    await ctx.send("⚠️ **Ocorreu um erro interno ao processar o comando.** Verifique se a variável MONGO_URI está configurada corretamente no Render.")
 
 # --- 7. COMANDOS ---
 
@@ -492,6 +501,7 @@ async def setcla(ctx, tag: str):
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
             "• `!vinculados` ➔ Lista todas as contas vinculadas.\n"
+            "• `!pendentes` ➔ Lista quem falta se vincular.\n"
             "• `!desvincular @membro` ➔ Remove vinculação."
         ),
         inline=False
@@ -598,6 +608,55 @@ async def vincular(ctx, *, nick_jogo: str = None):
 
     await set_mapping(acc_id, real_game_nick, ctx.author.id, str(ctx.author))
     await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {ctx.author.mention}")
+
+@bot.command(name="pendentes", aliases=["naovinculados"])
+async def pendentes(ctx):
+    """Exibe a lista de membros do clã no jogo que ainda NÃO se vincularam ao Discord."""
+    config = await get_server_config(ctx.guild.id)
+    if not config or not config.get('clan_tag'):
+        await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
+        return
+
+    loading_msg = await ctx.send("🔎 Verificando membros pendentes de vinculação...")
+    
+    tag, in_game_members = await fetch_clan_members(config['clan_tag'])
+    await loading_msg.delete()
+
+    if not in_game_members:
+        await ctx.send("❌ Não foi possível carregar os membros do clã.")
+        return
+
+    mappings = await get_all_mappings()
+
+    unlinked_members = [
+        m for m in in_game_members 
+        if m['account_id'] not in mappings
+    ]
+
+    if not unlinked_members:
+        await ctx.send(f"🎉 **Excelente!** Todos os **{len(in_game_members)}** membros do clã **[{tag}]** já estão vinculados!")
+        return
+
+    lines = []
+    for m in unlinked_members:
+        role_badge = m['role_badge']
+        lines.append(f"• **{m['account_name']}**{role_badge}")
+
+    embed = discord.Embed(
+        title=f"⚠️ Membros Pendentes de Vinculação [{tag}]",
+        description=(
+            f"Existe(m) **{len(unlinked_members)}** de **{len(in_game_members)}** jogador(es) que ainda **NÃO** se vincularam:\n\n"
+            + "\n".join(lines[:30])
+        ),
+        color=0xE74C3C
+    )
+
+    if len(lines) > 30:
+        embed.set_footer(text=f"E mais {len(lines) - 30} membro(s)... • Use !vincular NICK para registrá-los.")
+    else:
+        embed.set_footer(text="Instrua os membros a usarem: !vincular SEU_NICK")
+
+    await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
