@@ -149,6 +149,17 @@ def set_mapping(account_id: int, account_name: str, discord_id: int, discord_nam
     conn.commit()
     conn.close()
 
+def update_account_nickname_by_id(account_id: int, new_account_name: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE clan_mappings_v2
+        SET account_name = ?
+        WHERE account_id = ?
+    ''', (new_account_name, account_id))
+    conn.commit()
+    conn.close()
+
 def remove_mapping(discord_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -246,16 +257,20 @@ async def fetch_clan_members(target_tag: str):
                     account_ids = list(members.keys())
                     acc_ids_str = ",".join(account_ids)
                     
-                    acc_info_url = f"{base_url}/wotb/account/info/?application_id={APPLICATION_ID}&account_id={acc_ids_str}&fields=last_battle_time"
+                    acc_info_url = f"{base_url}/wotb/account/info/?application_id={APPLICATION_ID}&account_id={acc_ids_str}&fields=last_battle_time,nickname"
                     
                     last_battle_dict = {}
+                    real_nickname_dict = {}
                     async with session.get(acc_info_url, timeout=aiohttp.ClientTimeout(total=8)) as resp2:
                         if resp2.status == 200:
                             acc_data = await resp2.json()
                             player_stats = acc_data.get('data', {})
                             for pid, pinfo in player_stats.items():
-                                if pinfo and 'last_battle_time' in pinfo:
-                                    last_battle_dict[str(pid)] = pinfo['last_battle_time']
+                                if pinfo:
+                                    if 'last_battle_time' in pinfo:
+                                        last_battle_dict[str(pid)] = pinfo['last_battle_time']
+                                    if 'nickname' in pinfo:
+                                        real_nickname_dict[str(pid)] = pinfo['nickname']
 
                     now = now_br()
                     one_month_ago = now - timedelta(days=30)
@@ -263,6 +278,7 @@ async def fetch_clan_members(target_tag: str):
                     member_list = []
                     for m_id, m_info in members.items():
                         last_battle_ts = last_battle_dict.get(str(m_id), 0)
+                        updated_nick = real_nickname_dict.get(str(m_id), m_info.get('account_name'))
                         role = m_info.get('role', '')
                         role_order, role_badge = get_role_info(role)
                         
@@ -276,7 +292,7 @@ async def fetch_clan_members(target_tag: str):
                             
                         member_list.append({
                             'account_id': m_info['account_id'],
-                            'account_name': m_info['account_name'],
+                            'account_name': updated_nick,
                             'role': role,
                             'role_order': role_order,
                             'role_badge': role_badge,
@@ -320,8 +336,6 @@ def build_clan_embed(tag, in_game_members):
         else:
             apenas_jogo.append(f"• **{acc_name}**{role_badge}\n   └ 🕒 Última batalha: {time_str}")
             
-    now_ts = int(now_br().timestamp())
-    
     embed = discord.Embed(
         title=f"📋 Organização do Clã [{tag}]",
         description=(
@@ -429,6 +443,8 @@ async def send_inactivity_warning(guild, in_game_members):
 @tasks.loop(hours=1)
 async def auto_update_job():
     guild_ids = get_all_configured_servers()
+    mappings = get_all_mappings()
+
     for g_id in guild_ids:
         config = get_server_config(g_id)
         if not config or not config['clan_tag']:
@@ -438,10 +454,34 @@ async def auto_update_job():
         tag, in_game_members = await fetch_clan_members(clan_tag)
         if not in_game_members:
             continue
+
+        channel = bot.get_channel(config['channel_id']) if config.get('channel_id') else None
+
+        # --- IDEIA 4: DETECÇÃO DE MUDANÇA DE NICK ---
+        for m in in_game_members:
+            acc_id = m['account_id']
+            current_nick = m['account_name']
             
+            if acc_id in mappings:
+                old_nick = mappings[acc_id][0]['acc_name']
+                if old_nick != current_nick:
+                    # Atualiza o novo nick no banco de dados
+                    update_account_nickname_by_id(acc_id, current_nick)
+                    
+                    # Notifica no canal do clã
+                    if channel:
+                        discord_mentions = " / ".join(f"<@{d['discord_id']}>" for d in mappings[acc_id])
+                        await channel.send(
+                            f"✏️ **TROCA DE NICK DETECTADA:** O membro {discord_mentions} "
+                            f"alterou o seu nick de `{old_nick}` para **`{current_nick}`**!"
+                        )
+
+        # Recarrega os vínculos atualizados
+        mappings = get_all_mappings()
+
+        # Registro de Entradas e Saídas do Clã
         current_ids = {m['account_id']: m['account_name'] for m in in_game_members}
         last_ids_str = config.get('last_members')
-        channel = bot.get_channel(config['channel_id']) if config.get('channel_id') else None
         
         if last_ids_str and channel:
             old_ids = set(map(int, last_ids_str.split(','))) if last_ids_str else set()
@@ -455,6 +495,7 @@ async def auto_update_job():
         current_ids_str = ",".join(map(str, current_ids.keys()))
         update_last_members(g_id, current_ids_str)
         
+        # Atualiza a mensagem do painel principal
         if config.get('channel_id') and config.get('panel_message_id') and channel:
             try:
                 panel_msg = await channel.fetch_message(config['panel_message_id'])
@@ -520,6 +561,7 @@ async def setcla(ctx, tag: str):
             "• `!vincular` ➔ Inicia o assistente para ligar conta do jogo ao Discord.\n"
             "• `!desvincular @membro` ➔ Remove a vinculação de um usuário.\n"
             "• `!vinculados` ➔ Lista todas as contas vinculadas do servidor.\n"
+            "• `!removerausentes` ➔ Desativa o canal de alertas de ausentes.\n"
             "• `!ajuda` ➔ Exibe detalhes e explicações de cada função."
         ),
         inline=False
@@ -557,6 +599,16 @@ async def ajuda(ctx):
 async def setausentes(ctx, channel: discord.TextChannel):
     set_absent_channel(ctx.guild.id, channel.id)
     await ctx.send(f"✅ **Canal de ausentes definido para:** {channel.mention}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removerausentes(ctx):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE server_clans SET absent_channel_id = NULL WHERE guild_id = ?', (ctx.guild.id,))
+    conn.commit()
+    conn.close()
+    await ctx.send("🧹 **O canal de alertas de ausentes foi desativado com sucesso.**")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -605,7 +657,6 @@ async def painelonline(ctx):
 
 @bot.command()
 async def vincular(ctx):
-    """Comando interativo para vincular nick do WOTB ao membro do Discord."""
     def check_author(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
@@ -628,7 +679,6 @@ async def vincular(ctx):
         real_game_nick = game_nick
         
         for reg in regions:
-            # Busca com suporte a caracteres parciais/case-insensitive
             url = f"{reg}/wotb/account/list/?application_id={APPLICATION_ID}&search={game_nick}&type=startswith"
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -652,7 +702,6 @@ async def vincular(ctx):
         await ctx.send(f"❌ Não foi possível encontrar nenhum jogador com o nick **{game_nick}** na Wargaming.")
         return
 
-    # Se o usuário for administrador, ele pode escolher vincular para outra pessoa
     target_member = ctx.author
     if ctx.author.guild_permissions.administrator:
         clean_game_nick = real_game_nick.lower()
