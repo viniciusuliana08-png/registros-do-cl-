@@ -8,6 +8,13 @@ from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# Fuso horário de Brasília
+TIMEZONE_BR = ZoneInfo("America/Sao_Paulo")
+
+def now_br():
+    return datetime.now(TIMEZONE_BR)
 
 # --- 1. SERVIDOR WEB (FLASK PARA MANTER ON-LINE 24/7) ---
 app = Flask('')
@@ -32,14 +39,26 @@ def init_db():
     cursor = conn.cursor()
     
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS clan_mappings (
-            account_id INTEGER PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS clan_mappings_v2 (
+            discord_id INTEGER PRIMARY KEY,
+            account_id INTEGER,
             account_name TEXT,
-            discord_id INTEGER,
             discord_name TEXT
         )
     ''')
     
+    # Migração do banco antigo se existir
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clan_mappings'")
+    if cursor.fetchone():
+        cursor.execute("SELECT account_id, account_name, discord_id, discord_name FROM clan_mappings")
+        old_rows = cursor.fetchall()
+        for r in old_rows:
+            cursor.execute('''
+                INSERT OR REPLACE INTO clan_mappings_v2 (discord_id, account_id, account_name, discord_name)
+                VALUES (?, ?, ?, ?)
+            ''', (r[2], r[0], r[1], r[3]))
+        cursor.execute("DROP TABLE clan_mappings")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS server_clans (
             guild_id INTEGER PRIMARY KEY,
@@ -144,26 +163,37 @@ def set_mapping(account_id: int, account_name: str, discord_id: int, discord_nam
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO clan_mappings (account_id, account_name, discord_id, discord_name)
+        INSERT OR REPLACE INTO clan_mappings_v2 (discord_id, account_id, account_name, discord_name)
         VALUES (?, ?, ?, ?)
-    ''', (account_id, account_name, discord_id, discord_name))
+    ''', (discord_id, account_id, account_name, discord_name))
     conn.commit()
     conn.close()
 
 def remove_mapping(discord_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM clan_mappings WHERE discord_id = ?', (discord_id,))
+    cursor.execute('DELETE FROM clan_mappings_v2 WHERE discord_id = ?', (discord_id,))
     conn.commit()
     conn.close()
 
 def get_all_mappings():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('SELECT account_id, account_name, discord_id, discord_name FROM clan_mappings')
+    cursor.execute('SELECT account_id, account_name, discord_id, discord_name FROM clan_mappings_v2')
     rows = cursor.fetchall()
     conn.close()
-    return {row[0]: {'acc_name': row[1], 'discord_id': row[2], 'discord_name': row[3]} for row in rows}
+    
+    mappings = {}
+    for row in rows:
+        acc_id = row[0]
+        if acc_id not in mappings:
+            mappings[acc_id] = []
+        mappings[acc_id].append({
+            'acc_name': row[1],
+            'discord_id': row[2],
+            'discord_name': row[3]
+        })
+    return mappings
 
 init_db()
 
@@ -177,20 +207,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 APPLICATION_ID = os.environ.get("APPLICATION_ID")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
-def get_role_badge(role: str) -> str:
+def get_role_info(role: str):
     if not role:
-        return ""
+        return 99, ""
     
     r = str(role).lower().strip()
     
     if r in ['leader', 'commander', 'clan_commander', 'leader_clan']:
-        return " 👑 [Líder]"
+        return 1, " 👑 [Líder]"
     elif r in ['executive_officer', 'vice_leader', 'co_leader', 'deputy_commander', 'sub_commander']:
-        return " ⚔️ [Vice-Líder]"
+        return 2, " ⚔️ [Vice-Líder]"
     elif r in ['commander_assistant', 'recruiter', 'diplomat', 'quartermaster', 'personnel_officer', 'combat_officer']:
-        return " 📜 [Oficial]"
+        return 3, " 📜 [Oficial]"
         
-    return ""
+    return 4, ""
 
 async def fetch_clan_members(target_tag: str):
     regions = [
@@ -248,17 +278,18 @@ async def fetch_clan_members(target_tag: str):
                                 if pinfo and 'last_battle_time' in pinfo:
                                     last_battle_dict[str(pid)] = pinfo['last_battle_time']
 
-                    now = datetime.now()
+                    now = now_br()
                     one_month_ago = now - timedelta(days=30)
                     
                     member_list = []
                     for m_id, m_info in members.items():
                         last_battle_ts = last_battle_dict.get(str(m_id), 0)
                         role = m_info.get('role', '')
+                        role_order, role_badge = get_role_info(role)
                         
                         is_inactive_30d = False
                         if last_battle_ts > 0:
-                            dt_last_battle = datetime.fromtimestamp(last_battle_ts)
+                            dt_last_battle = datetime.fromtimestamp(last_battle_ts, tz=TIMEZONE_BR)
                             last_battle_str = dt_last_battle.strftime('%d/%m/%Y %H:%M')
                             if dt_last_battle < one_month_ago:
                                 is_inactive_30d = True
@@ -270,12 +301,15 @@ async def fetch_clan_members(target_tag: str):
                             'account_id': m_info['account_id'],
                             'account_name': m_info['account_name'],
                             'role': role,
+                            'role_order': role_order,
+                            'role_badge': role_badge,
                             'last_battle': last_battle_str,
                             'raw_ts': last_battle_ts,
                             'is_inactive_30d': is_inactive_30d
                         })
                     
-                    member_list.sort(key=lambda x: x['raw_ts'], reverse=True)
+                    # Ordenação: Líder -> Vice-Líder -> Oficial -> Membro
+                    member_list.sort(key=lambda x: (x['role_order'], -x['raw_ts']))
                     return clan_data.get('tag'), member_list
         except Exception as e:
             print(f"Erro ao carregar membros do clã: {e}")
@@ -293,18 +327,19 @@ def build_clan_embed(tag, in_game_members):
         acc_id = m['account_id']
         acc_name = m['account_name']
         last_b = m['last_battle']
-        role_badge = get_role_badge(m['role'])
+        role_badge = m['role_badge']
         
         if m['is_inactive_30d']:
             inativos_30d.append(f"• **{acc_name}**{role_badge} | ⚠️ *Inativo (+30d) - Última: {last_b}*")
         
         if acc_id in mappings:
-            d_info = mappings[acc_id]
-            em_ambos.append(f"• **{acc_name}**{role_badge} ➔ <@{d_info['discord_id']}> | 🕒 *{last_b}*")
+            discord_list = mappings[acc_id]
+            mentions_str = " / ".join(f"<@{d['discord_id']}>" for d in discord_list)
+            em_ambos.append(f"• **{acc_name}**{role_badge} ➔ {mentions_str} | 🕒 *{last_b}*")
         else:
             apenas_jogo.append(f"• **{acc_name}**{role_badge} | 🕒 *{last_b}*")
             
-    now_str = datetime.now().strftime('%d/%m/%Y às %H:%M')
+    now_str = now_br().strftime('%d/%m/%Y às %H:%M (Horário de Brasília)')
     
     embed = discord.Embed(
         title=f"📋 Organização do Clã [{tag}]",
@@ -344,20 +379,20 @@ def build_clan_embed(tag, in_game_members):
     return embed
 
 def build_online_embed(tag, in_game_members):
-    now = datetime.now()
+    now = now_br()
     recent_activity = []
     
     for m in in_game_members:
         if m['raw_ts'] > 0:
-            dt_battle = datetime.fromtimestamp(m['raw_ts'])
+            dt_battle = datetime.fromtimestamp(m['raw_ts'], tz=TIMEZONE_BR)
             diff = now - dt_battle
             if diff <= timedelta(hours=2):
                 mins = int(diff.total_seconds() / 60)
                 time_str = f"há {mins} min" if mins > 0 else "agora mesmo"
-                role_badge = get_role_badge(m['role'])
+                role_badge = m['role_badge']
                 recent_activity.append(f"🎮 **{m['account_name']}**{role_badge} — *Jogou {time_str}*")
 
-    now_str = now.strftime('%H:%M:%S')
+    now_str = now.strftime('%H:%M:%S (Horário de Brasília)')
     embed = discord.Embed(
         title=f"⚡ Atividade Recente / Online [{tag}]",
         description="Mostra jogadores que batalharam nos últimos **120 minutos**.",
@@ -394,8 +429,9 @@ async def send_inactivity_warning(guild, in_game_members):
         acc_name = m['account_name']
         
         if acc_id in mappings:
-            discord_id = mappings[acc_id]['discord_id']
-            msg = f"<@{discord_id}> você está ha um mês sem jogar, por favor para não considerarmos um jogador inativo jogue uma unica batalha no modo REGULAR, obrigado pela atenção"
+            discord_list = mappings[acc_id]
+            mentions_str = " ".join(f"<@{d['discord_id']}>" for d in discord_list)
+            msg = f"{mentions_str} você está há um mês sem jogar, por favor para não considerarmos um jogador inativo jogue uma única batalha no modo REGULAR, obrigado pela atenção."
             await absent_channel.send(msg)
         else:
             unlinked_inactives.append(acc_name)
@@ -471,7 +507,7 @@ async def before_loops():
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot do Clã online como: {bot.user}")
+    print(f"✅ Bot do Clã online como: {bot.user} | Horário de Brasília: {now_br().strftime('%d/%m/%Y %H:%M:%S')}")
     if not auto_update_job.is_running():
         auto_update_job.start()
     if not fast_online_update_job.is_running():
@@ -484,7 +520,82 @@ async def on_ready():
 async def setcla(ctx, tag: str):
     clean_tag = tag.strip().upper()
     set_server_clan(ctx.guild.id, clean_tag)
-    await ctx.send(f"✅ **Clã configurado!** TAG: **[{clean_tag}]**.\nUse `!setausentes #canal` para definir o canal de avisos de ausência.")
+    
+    embed = discord.Embed(
+        title=f"✅ Clã Configurado: [{clean_tag}]",
+        description="O clã foi atrelado a este servidor. Confira abaixo o **manual resumido de comandos**:",
+        color=0x2ECC71
+    )
+    embed.add_field(
+        name="🛠️ Comandos Principais",
+        value=(
+            "• `!setausentes #canal` ➔ Define canal de avisos de inativos (+30d).\n"
+            "• `!painel` ➔ Cria o painel fixo de organização do clã (auto-atualiza a cada 1h).\n"
+            "• `!painelonline` ➔ Cria o painel fixo de membros online/batalhas recentes (auto-atualiza a cada 5m).\n"
+            "• `!membros` ➔ Exibe instantaneamente a lista atual de membros.\n"
+            "• `!vincular` ➔ Inicia o assistente para ligar conta do jogo ao Discord.\n"
+            "• `!desvincular @membro` ➔ Remove a vinculação de um membro.\n"
+            "• `!vinculados` ➔ Lista todas as contas vinculadas do servidor.\n"
+            "• `!ajuda` ➔ Exibe o guia detalhado sobre o funcionamento do bot."
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Horário configurado: Brasília (UTC-3) • Digite !ajuda para detalhes.")
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def ajuda(ctx):
+    """Exibe o manual detalhado de funcionamento e uso do Bot."""
+    embed = discord.Embed(
+        title="📖 Guia e Manual do Bot de Gestão de Clã",
+        description="Este bot gerencia a organização do clã no WOTB integrando dados do jogo com o seu servidor do Discord.",
+        color=0x3498DB
+    )
+    
+    embed.add_field(
+        name="👑 Hierarquia e Exibição",
+        value=(
+            "A lista do clã organiza os jogadores automaticamente por **Cargo Wargaming**:\n"
+            "1️⃣ **Líder** 👑\n"
+            "2️⃣ **Vice-Líderes** ⚔️\n"
+            "3️⃣ **Oficiais** 📜\n"
+            "4️⃣ **Membros**\n"
+            "*Dentro de cada grupo, os mais ativos recentemente ficam no topo.*"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔗 Vincular Contas (!vincular / !desvincular)",
+        value=(
+            "• `!vincular`: O bot pergunta o nick do WOTB e busca automaticamente pelo nome ou apelido equivalente no servidor. "
+            "É possível vincular **mais de uma conta do Discord na mesma conta do jogo**.\n"
+            "• `!desvincular @Membro`: Remove o vínculo da conta selecionada."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚠️ Controle de Inatividade (+30 dias)",
+        value=(
+            "Jogadores sem batalhar há mais de 30 dias entram na lista de inativos. "
+            "Se o canal de ausentes estiver definido (`!setausentes #canal`), o bot menciona automaticamente os vinculados que estiverem ausentes."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚡ Painéis em Tempo Real (!painel / !painelonline)",
+        value=(
+            "• **Painel Principal (`!painel`)**: Fixo no canal, atualizado de hora em hora. Registra entradas e saídas de membros.\n"
+            "• **Painel Online (`!painelonline`)**: Fixo no canal, atualizado a cada 5 minutos com quem jogou nas últimas 2 horas."
+        ),
+        inline=False
+    )
+    
+    embed.set_footer(text="Horário do Bot: Brasília (UTC-3)")
+    await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -542,21 +653,19 @@ async def painelonline(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def vincular(ctx):
-    """[Admin] Processo interativo de vinculação baseado na lista do servidor Discord."""
+    """[Admin] Processo interativo de vinculação com suporte a múltiplos perfis."""
     def check_author(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
-    # PASSO 1: Perguntar Nick no Jogo
     await ctx.send("🎮 **Qual é o Nick do jogador no WOTB?**")
     try:
         msg_game = await bot.wait_for('message', check=check_author, timeout=40.0)
     except asyncio.TimeoutError:
-        await ctx.send("⏰ **Tempo esgotado!** Processo de vinculação cancelado.")
+        await ctx.send("⏰ **Tempo esgotado!** Processo cancelado.")
         return
 
     game_nick = msg_game.content.strip()
     
-    # Busca na API Wargaming
     async with aiohttp.ClientSession() as session:
         regions = ["https://api.wotblitz.com", "https://api.wotblitz.eu", "https://api.wotblitz.asia"]
         acc_id = None
@@ -584,10 +693,7 @@ async def vincular(ctx):
         await ctx.send(f"❌ Não encontrei nenhum jogador com o nick **{game_nick}** no WOTB. Processo cancelado.")
         return
 
-    # BUSCA INTELIGENTE NA LISTA DE MEMBROS DO DISCORD DA GUILD
     clean_game_nick = real_game_nick.lower()
-    
-    # Mapeia nomes do discord e apelidos no servidor para os objetos de membros
     members_map = {}
     for member in ctx.guild.members:
         members_map[member.name.lower()] = member
@@ -595,17 +701,14 @@ async def vincular(ctx):
 
     target_member = None
 
-    # Tenta encontrar correspondência exata primeiro ou mais próxima na lista do Discord
     if clean_game_nick in members_map:
         target_member = members_map[clean_game_nick]
     else:
-        # Procura por semelhança usando os nomes dos membros do servidor Discord
         all_discord_names = list(members_map.keys())
         matches = difflib.get_close_matches(clean_game_nick, all_discord_names, n=1, cutoff=0.45)
         if matches:
             target_member = members_map[matches[0]]
 
-    # PERGUNTA BASEADA NO QUE FOI ENCONTRADO NO SERVIDOR
     if target_member:
         await ctx.send(
             f"🔎 Encontrei o jogador **{real_game_nick}** na Wargaming.\n"
@@ -614,18 +717,17 @@ async def vincular(ctx):
         try:
             msg_confirm = await bot.wait_for('message', check=check_author, timeout=25.0)
             if msg_confirm.content.strip().lower() not in ['s', 'sim', 'yes', 'y']:
-                target_member = None  # Respondeu 'não', prossegue para seleção manual
+                target_member = None
         except asyncio.TimeoutError:
             await ctx.send("⏰ Tempo esgotado. Processo cancelado.")
             return
 
-    # SE NÃO ENCONTROU OU RESPINDEU 'NÃO', PEDE PARA ESPECIFICAR O MEMBRO
     if not target_member:
         await ctx.send("💬 Por favor, mencione (`@membro`), digite o Nome/Apelido exato ou o ID do membro do Discord:")
         try:
             msg_discord = await bot.wait_for('message', check=check_author, timeout=40.0)
         except asyncio.TimeoutError:
-            await ctx.send("⏰ **Tempo esgotado!** Processo de vinculação cancelado.")
+            await ctx.send("⏰ **Tempo esgotado!** Processo cancelado.")
             return
 
         input_user = msg_discord.content.strip()
@@ -644,7 +746,6 @@ async def vincular(ctx):
         await ctx.send(f"❌ Não foi possível encontrar nenhum membro no servidor referente a essa resposta.")
         return
 
-    # Salva no banco de dados
     set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
     await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
 
@@ -661,7 +762,13 @@ async def vinculados(ctx):
     if not mappings:
         await ctx.send("ℹ️ Nenhum membro vinculado ainda.")
         return
-    lines = [f"• **{info['acc_name']}** ➔ <@{info['discord_id']}>" for acc_id, info in mappings.items()]
+    
+    lines = []
+    for acc_id, d_list in mappings.items():
+        game_nick = d_list[0]['acc_name']
+        mentions = " / ".join(f"<@{d['discord_id']}>" for d in d_list)
+        lines.append(f"• **{game_nick}** ➔ {mentions}")
+        
     embed = discord.Embed(title="🔗 Membros Vinculados", description="\n".join(lines), color=0x2ECC71)
     await ctx.send(embed=embed)
 
