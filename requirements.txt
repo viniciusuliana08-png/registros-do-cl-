@@ -1,6 +1,6 @@
 discord.py
 aiohttp
-pymongo[srv]
+pymongo
+motor
 dnspython
 certifi
-motor
