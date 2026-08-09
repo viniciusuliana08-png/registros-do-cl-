@@ -6,6 +6,7 @@ import discord
 from discord.ext import commands
 from aiohttp import web
 import pymongo
+import certifi
 
 # --- Configurações de Variáveis de Ambiente ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -14,7 +15,8 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 # --- Conexão com o Banco de Dados MongoDB ---
 try:
-    mongo_client = pymongo.MongoClient(MONGO_URI)
+    # Usa certifi.where() para evitar falhas de SSL handshake no Linux/Render
+    mongo_client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
     db = mongo_client["wotb_bot_db"]
     servers_col = db["servers"]
     mappings_col = db["mappings"]
@@ -25,9 +27,12 @@ except Exception as e:
 # --- Funções de Banco de Dados (MongoDB) ---
 
 def get_server_config(guild_id):
-    doc = servers_col.find_one({"guild_id": str(guild_id)})
-    if doc:
-        return {"clan_tag": doc.get("clan_tag"), "clan_id": doc.get("clan_id")}
+    try:
+        doc = servers_col.find_one({"guild_id": str(guild_id)})
+        if doc:
+            return {"clan_tag": doc.get("clan_tag"), "clan_id": doc.get("clan_id")}
+    except Exception as e:
+        print(f"Erro ao buscar config do servidor: {e}")
     return {"clan_tag": None, "clan_id": None}
 
 def set_server_config(guild_id, clan_tag, clan_id):
@@ -154,9 +159,12 @@ async def fetch_clan_members(tag_or_id):
 @bot.event
 async def on_ready():
     await start_web_server()
-    total_vinculos = mappings_col.count_documents({})
+    try:
+        total_vinculos = mappings_col.count_documents({})
+        print(f"📊 Banco de Dados carregado: {total_vinculos} vínculos salvos na nuvem.")
+    except Exception as e:
+        print(f"⚠️ Erro ao consultar registros do MongoDB no start: {e}")
     print(f"✅ Bot online com sucesso como: {bot.user}")
-    print(f"📊 Banco de Dados carregado: {total_vinculos} vínculos salvos na nuvem.")
 
 # --- Comandos do Bot ---
 
