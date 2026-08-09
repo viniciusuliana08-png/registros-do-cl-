@@ -317,7 +317,6 @@ def build_online_embed(tag, in_game_members):
         if m['raw_ts'] > 0:
             dt_battle = datetime.fromtimestamp(m['raw_ts'], tz=TIMEZONE_BR)
             diff = now - dt_battle
-            # 🔥 ALTERAÇÃO: Passou de 2 horas para 15 minutos 🔥
             if diff <= timedelta(minutes=15):
                 mins = int(diff.total_seconds() / 60)
                 time_str = f"há {mins} min" if mins > 0 else "agora mesmo"
@@ -497,7 +496,7 @@ async def setcla(ctx, tag: str):
     embed.add_field(
         name="🛠️ Comandos Principais",
         value=(
-            "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord em 1 passo.\n"
+            "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord de forma rápida e inteligente.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
@@ -569,7 +568,11 @@ async def painelonline(ctx):
 
 @bot.command()
 async def vincular(ctx, *, nick_jogo: str = None):
-    """Vincular nick do WOTB buscando primeiro no Discord e confirmando."""
+    """Vincula o nick do WOTB em 1 passo, buscando similaridades no jogo e validando o Discord."""
+    if not nick_jogo:
+        await ctx.send("⚠️ **Uso incorreto!** Digite o seu nick do jogo junto com o comando.\nExemplo: `!vincular 2pende`")
+        return
+
     config = await get_server_config(ctx.guild.id)
     if not config or not config.get('clan_tag'):
         await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
@@ -578,18 +581,7 @@ async def vincular(ctx, *, nick_jogo: str = None):
     def check_author(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
-    if not nick_jogo:
-        await ctx.send("🎮 **Qual é o seu Nick no WOTB?** *(Responda nesta conversa em até 30 segundos)*")
-        try:
-            msg_game = await bot.wait_for('message', check=check_author, timeout=30.0)
-            nick_jogo = msg_game.content.strip()
-        except asyncio.TimeoutError:
-            await ctx.send("⏰ **Tempo esgotado!** Digite `!vincular NICK` novamente.")
-            return
-
-    search_nick = nick_jogo.lower()
     loading_msg = await ctx.send("🔎 Buscando jogador no clã...")
-    
     tag, clan_members = await fetch_clan_members(config['clan_tag'])
     await loading_msg.delete()
 
@@ -597,10 +589,10 @@ async def vincular(ctx, *, nick_jogo: str = None):
         await ctx.send("❌ Não foi possível carregar os membros do clã.")
         return
 
-    # 🔥 ALTERAÇÃO: Tenta encontrar o nick exato primeiro
+    search_nick = nick_jogo.lower()
     matches = [m for m in clan_members if search_nick == m['account_name'].lower()]
 
-    # 🔥 ALTERAÇÃO: Se não achou exato, usa Fuzzy Matching (difflib) para achar nomes parecidos
+    # Se não achou exato, usa Fuzzy Matching para corrigir erros de digitação no nick
     if not matches:
         clan_nicks = [m['account_name'] for m in clan_members]
         close_matches = difflib.get_close_matches(nick_jogo, clan_nicks, n=1, cutoff=0.5)
@@ -608,7 +600,7 @@ async def vincular(ctx, *, nick_jogo: str = None):
         if close_matches:
             matched_nick = close_matches[0]
             matches = [m for m in clan_members if m['account_name'] == matched_nick]
-            await ctx.send(f"💡 Não encontrei exatamente `{nick_jogo}`, mas encontrei **{matched_nick}**. Usando este nick...")
+            await ctx.send(f"💡 Não encontrei exatamente `{nick_jogo}`, mas encontrei **{matched_nick}** no clã. Usando este nick...")
 
     if not matches:
         await ctx.send(f"❌ O jogador **{nick_jogo}** (ou nicks parecidos) não foi encontrado dentro do clã **[{tag}]**.")
@@ -618,11 +610,13 @@ async def vincular(ctx, *, nick_jogo: str = None):
     acc_id = selected_player['account_id']
     real_game_nick = selected_player['account_name']
 
+    # 1. Procura automaticamente se há alguém com nick/apelido parecido no Discord
     target_member = discord.utils.find(
         lambda m: real_game_nick.lower() in m.name.lower() or (m.nick and real_game_nick.lower() in m.nick.lower()),
         ctx.guild.members
     )
 
+    # 2. Se encontrou um perfil parecido no Discord, pergunta para confirmar
     if target_member:
         await ctx.send(
             f"🎯 Encontrado no jogo: **{real_game_nick}**!\n"
@@ -633,11 +627,12 @@ async def vincular(ctx, *, nick_jogo: str = None):
             resposta = msg_confirm.content.strip().lower()
 
             if resposta not in ['sim', 's', 'yes', 'y']:
-                target_member = None
+                target_member = None  # Se disser não, limpa para pedir a menção manual
         except asyncio.TimeoutError:
             await ctx.send("⏰ **Tempo esgotado!** Vinculação cancelada.")
             return
 
+    # 3. Se não achou automaticamente ou se respondeu "não", pede a menção manual
     if not target_member:
         await ctx.send("💬 Por favor, mencione o membro correto do Discord (ex: `@username` ou digite `eu` se for você):")
         try:
@@ -662,6 +657,7 @@ async def vincular(ctx, *, nick_jogo: str = None):
             await ctx.send("⏰ **Tempo esgotado!** Vinculação cancelada.")
             return
 
+    # 4. Salva no banco de dados
     await set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
     await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
 
