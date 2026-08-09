@@ -3,3 +3,4 @@ aiohttp
 pymongo[srv]
 dnspython
 certifi
+motor
