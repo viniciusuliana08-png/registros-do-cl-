@@ -29,7 +29,6 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Mapeamento de membros: Account_ID <-> Discord ID
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS clan_mappings (
             account_id INTEGER PRIMARY KEY,
@@ -39,7 +38,6 @@ def init_db():
         )
     ''')
     
-    # Configuração de clã por servidor do Discord: Guild_ID <-> Clan_Tag
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS server_clans (
             guild_id INTEGER PRIMARY KEY,
@@ -106,7 +104,7 @@ APPLICATION_ID = os.environ.get("APPLICATION_ID")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 async def fetch_clan_members(target_tag: str):
-    """Busca o clã pela TAG exata nas regiões e retorna os membros."""
+    """Busca o clã pela TAG exata, e depois busca a última batalha de cada membro."""
     regions = [
         "https://api.wotblitz.com",
         "https://api.wotblitz.eu",
@@ -117,7 +115,7 @@ async def fetch_clan_members(target_tag: str):
         base_url = None
         exact_tag = target_tag.upper()
         
-        # Procura o clã com a TAG EXATA
+        # 1. Procura o clã com a TAG EXATA
         for reg in regions:
             url = f"{reg}/wotb/clans/list/?application_id={APPLICATION_ID}&search={exact_tag}"
             try:
@@ -132,13 +130,13 @@ async def fetch_clan_members(target_tag: str):
                                 break
                         if clan_id:
                             break
-            except Exception as e:
-                print(f"Erro na busca do clã em {reg}: {e}")
+            except Exception:
+                pass
                 
         if not clan_id:
             return None, []
             
-        # Puxa informações detalhadas do clã
+        # 2. Puxa os IDs de todos os membros do clã
         clan_info_url = f"{base_url}/wotb/clans/info/?application_id={APPLICATION_ID}&clan_id={clan_id}&extra=members"
         try:
             async with session.get(clan_info_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -147,17 +145,38 @@ async def fetch_clan_members(target_tag: str):
                     clan_data = data.get('data', {}).get(str(clan_id), {})
                     members = clan_data.get('members', {})
                     
+                    if not members:
+                        return clan_data.get('tag'), []
+                        
+                    # Prepara uma lista com todos os account_ids para puxar de uma vez
+                    account_ids = list(members.keys())
+                    acc_ids_str = ",".join(account_ids)
+                    
+                    # 3. Faz uma requisição secundária para pegar o 'last_battle_time' de todo mundo
+                    acc_info_url = f"{base_url}/wotb/account/info/?application_id={APPLICATION_ID}&account_id={acc_ids_str}&fields=last_battle_time"
+                    
+                    last_battle_dict = {}
+                    async with session.get(acc_info_url, timeout=aiohttp.ClientTimeout(total=8)) as resp2:
+                        if resp2.status == 200:
+                            acc_data = await resp2.json()
+                            player_stats = acc_data.get('data', {})
+                            for pid, pinfo in player_stats.items():
+                                if pinfo and 'last_battle_time' in pinfo:
+                                    last_battle_dict[str(pid)] = pinfo['last_battle_time']
+
                     member_list = []
-                    for m in members.values():
-                        last_battle_ts = m.get('last_battle_time', 0)
+                    for m_id, m_info in members.items():
+                        # Cruza a lista de membros com o dicionário de datas que acabamos de puxar
+                        last_battle_ts = last_battle_dict.get(str(m_id), 0)
+                        
                         if last_battle_ts > 0:
                             last_battle_str = datetime.fromtimestamp(last_battle_ts).strftime('%d/%m/%Y %H:%M')
                         else:
                             last_battle_str = "Sem registros"
                             
                         member_list.append({
-                            'account_id': m['account_id'],
-                            'account_name': m['account_name'],
+                            'account_id': m_info['account_id'],
+                            'account_name': m_info['account_name'],
                             'last_battle': last_battle_str,
                             'raw_ts': last_battle_ts
                         })
