@@ -1,6 +1,8 @@
 discord.py
 aiohttp
+flask
 pymongo
 motor
 dnspython
 certifi
+tzdata
