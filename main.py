@@ -1,6 +1,7 @@
 import os
 import asyncio
 import difflib
+import traceback
 import aiohttp
 import discord
 from discord.ext import commands
@@ -19,11 +20,11 @@ try:
     db = mongo_client["wotb_bot_db"]
     servers_col = db["servers"]
     mappings_col = db["mappings"]
-    print("✅ Conexão inicial com o MongoDB configurada com sucesso!")
+    print("✅ Conexão com o MongoDB estabelecida!")
 except Exception as e:
     print(f"❌ Erro ao conectar ao MongoDB: {e}")
 
-# --- Funções de Banco de Dados (MongoDB) ---
+# --- Funções do Banco de Dados ---
 
 def get_server_config(guild_id):
     try:
@@ -31,7 +32,7 @@ def get_server_config(guild_id):
         if doc:
             return {"clan_tag": doc.get("clan_tag"), "clan_id": doc.get("clan_id")}
     except Exception as e:
-        print(f"Erro ao buscar config do servidor: {e}")
+        print(f"Erro ao ler banco: {e}")
     return {"clan_tag": None, "clan_id": None}
 
 def set_server_config(guild_id, clan_tag, clan_id):
@@ -64,7 +65,7 @@ def remove_mapping_by_nick(account_name):
 def get_all_mappings():
     return list(mappings_col.find({}, {"_id": 0}))
 
-# --- Configuração do Bot Discord ---
+# --- Configuração do Bot ---
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -73,10 +74,10 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- Servidor HTTP Mínimo (Render Health Check) ---
+# --- Servidor HTTP (Health Check do Render) ---
 
 async def handle_ping(request):
-    return web.Response(text="Bot WOTB online e rodando no Render!")
+    return web.Response(text="Bot On!")
 
 async def start_web_server():
     app = web.Application()
@@ -86,12 +87,11 @@ async def start_web_server():
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Servidor HTTP rodando na porta {port} (Render OK)")
+    print(f"🌐 Servidor Web rodando na porta {port}")
 
-# --- Funções da API Wargaming ---
+# --- Integração API Wargaming ---
 
 async def fetch_clan_id_by_tag(tag):
-    # Normaliza qualquer tipo de hífen/traço
     clean_tag = str(tag).strip().replace("[", "").replace("]", "").replace("–", "-").replace("—", "-")
     app_id = WARGAMING_APP_ID or "demo"
     url = "https://api.wotblitz.com/wotb/clans/list/"
@@ -106,14 +106,11 @@ async def fetch_clan_id_by_tag(tag):
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == "ok" and data.get("data"):
-                    # Tenta encontrar a correspondência exata ignorando maiúsculas/minúsculas e hífens
-                    target_normalized = clean_tag.lower().replace("-", "")
+                    # Tenta achar correspondência exata de tag
                     for clan in data["data"]:
-                        clan_tag_api = clan.get("tag", "").strip()
-                        if clan_tag_api.lower().replace("-", "") == target_normalized:
-                            return clan.get("clan_id"), clan_tag_api
-                    
-                    # Se não achou exato, pega o primeiro retornado pela API
+                        if clan.get("tag", "").lower().replace("-", "") == clean_tag.lower().replace("-", ""):
+                            return clan.get("clan_id"), clan.get("tag")
+                    # Se não achar exato, pega a primeira opção retornada
                     first_clan = data["data"][0]
                     return first_clan.get("clan_id"), first_clan.get("tag")
             return None, None
@@ -157,207 +154,134 @@ async def fetch_clan_members(tag_or_id):
                     return tag, members_list
             return None, []
 
-# --- Eventos do Bot ---
+# --- Eventos e Tratamento de Erros ---
 
 @bot.event
 async def on_ready():
     await start_web_server()
-    try:
-        total_vinculos = mappings_col.count_documents({})
-        print(f"📊 Banco de Dados carregado: {total_vinculos} vínculos salvos na nuvem.")
-    except Exception as e:
-        print(f"⚠️ Erro ao consultar registros do MongoDB no start: {e}")
-    print(f"✅ Bot online com sucesso como: {bot.user}")
+    print(f"✅ Bot conectado como: {bot.user}")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    # Garante que os comandos ! sejam processados corretamente
+    await bot.process_commands(message)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Você não tem permissão para usar este comando.")
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    else:
+        print(f"⚠️ Erro ao executar comando: {error}")
+        traceback.print_exc()
 
 # --- Comandos do Bot ---
 
 @bot.command(name="setcla")
 @commands.has_permissions(administrator=True)
 async def setcla(ctx, *, tag: str = None):
-    """Configura a TAG do Clã do servidor."""
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel
-
+    """Configura o clã para o servidor."""
     if not tag:
-        await ctx.send("⚙️ **Qual a TAG do clã que deseja configurar para este servidor?** (ex: `MR-S`)")
-        try:
-            msg = await bot.wait_for('message', check=check, timeout=30.0)
-            tag = msg.content.strip()
-        except asyncio.TimeoutError:
-            await ctx.send("⏰ Tempo esgotado! Configuração cancelada.")
-            return
+        await ctx.send("⚙️ Digite a TAG do clã. Exemplo: `!setcla MR-S`")
+        return
 
-    loading = await ctx.send(f"🔎 Validando clã `[{tag}]` na Wargaming...")
+    loading = await ctx.send(f"🔎 Buscando clã `[{tag}]` na Wargaming...")
     clan_id, real_tag = await fetch_clan_id_by_tag(tag)
-    
+
     try:
         await loading.delete()
     except Exception:
         pass
 
     if not clan_id:
-        await ctx.send(f"❌ Não foi possível encontrar o clã com a TAG `[{tag}]` na Wargaming. Verifique se o nome está correto.")
+        await ctx.send(f"❌ Não foi possível encontrar o clã com a TAG `[{tag}]` na Wargaming.")
         return
 
     set_server_config(ctx.guild.id, real_tag, clan_id)
-    await ctx.send(f"✅ Clã **[{real_tag}]** (ID: `{clan_id}`) configurado com sucesso e salvo na nuvem!")
+    await ctx.send(f"✅ Clã **[{real_tag}]** (ID: `{clan_id}`) configurado e salvo no banco de dados!")
 
 @bot.command(name="vincular")
 async def vincular(ctx, *, nick_direto: str = None):
-    """Vincular jogador do WOTB ao Discord."""
+    """Vincula o nick do jogador no WOTB com a conta do Discord."""
     config = get_server_config(ctx.guild.id)
     if not config or not config.get('clan_tag'):
-        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Um Admin precisa usar `!setcla TAG` primeiro.")
+        await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
         return
 
     def check_author(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
     if not nick_direto:
-        await ctx.send("🎮 **Qual é o Nick no jogo do jogador que deseja vincular?**")
+        await ctx.send("🎮 Qual seu nick no jogo?")
         try:
-            msg_game = await bot.wait_for('message', check=check_author, timeout=30.0)
-            search_nick = msg_game.content.strip().lower()
+            msg = await bot.wait_for('message', check=check_author, timeout=30.0)
+            search_nick = msg.content.strip().lower()
         except asyncio.TimeoutError:
-            await ctx.send("⏰ **Tempo esgotado!** Processo cancelado.")
+            await ctx.send("⏰ Tempo esgotado!")
             return
     else:
         search_nick = nick_direto.strip().lower()
 
-    loading_msg = await ctx.send("🔎 Buscando jogador no clã...")
-    tag, clan_members = await fetch_clan_members(config['clan_tag'])
+    loading = await ctx.send("🔎 Procurando no clã...")
+    tag, members = await fetch_clan_members(config['clan_tag'])
 
     try:
-        await loading_msg.delete()
+        await loading.delete()
     except Exception:
         pass
 
-    if not clan_members:
-        await ctx.send("❌ Não foi possível obter os membros do clã na Wargaming.")
+    if not members:
+        await ctx.send("❌ Não foi possível carregar a lista de membros do clã.")
         return
 
-    matches = [m for m in clan_members if search_nick in m['account_name'].lower()]
+    matches = [m for m in members if search_nick in m['account_name'].lower()]
 
     if not matches:
-        await ctx.send(f"❌ O jogador **{search_nick}** não foi encontrado na lista de membros do clã **[{tag}]**.")
+        await ctx.send(f"❌ O nick `{search_nick}` não foi encontrado na lista do clã **[{tag}]**.")
         return
 
-    selected_player = None
-    if len(matches) == 1:
-        selected_player = matches[0]
-    else:
-        options_text = "\n".join([f"**{i+1}.** {m['account_name']}" for i, m in enumerate(matches[:5])])
-        await ctx.send(
-            f"🔎 Encontrei mais de um jogador compatível no clã **[{tag}]**:\n{options_text}\n\n"
-            f"👉 Digite apenas o **número** da opção desejada (1 a {min(len(matches), 5)}):"
-        )
-        try:
-            msg_choice = await bot.wait_for('message', check=check_author, timeout=30.0)
-            if msg_choice.content.strip().isdigit():
-                idx = int(msg_choice.content.strip()) - 1
-                if 0 <= idx < len(matches[:5]):
-                    selected_player = matches[idx]
-        except asyncio.TimeoutError:
-            await ctx.send("⏰ Tempo esgotado! Seleção cancelada.")
-            return
-
-    if not selected_player:
-        await ctx.send("❌ Opção inválida. Processo de vinculação cancelado.")
-        return
-
+    selected_player = matches[0]
     acc_id = selected_player['account_id']
-    real_game_nick = selected_player['account_name']
+    real_nick = selected_player['account_name']
 
     target_member = ctx.author
-    if ctx.author.guild_permissions.administrator:
-        clean_game_nick = real_game_nick.lower()
-        members_map = {m.name.lower(): m for m in ctx.guild.members}
-        members_map.update({m.display_name.lower(): m for m in ctx.guild.members})
-
-        found_match = None
-        if clean_game_nick in members_map:
-            found_match = members_map[clean_game_nick]
-        else:
-            close = difflib.get_close_matches(clean_game_nick, list(members_map.keys()), n=1, cutoff=0.4)
-            if close:
-                found_match = members_map[close[0]]
-
-        if found_match and found_match != ctx.author:
-            await ctx.send(
-                f"🔎 Conta do jogo: **{real_game_nick}**.\n"
-                f"Deseja vincular ao membro {found_match.mention}? *(Responda 's' para Sim ou 'n' para Não)*"
-            )
-            try:
-                msg_confirm = await bot.wait_for('message', check=check_author, timeout=30.0)
-                if msg_confirm.content.strip().lower() in ['s', 'sim', 'yes', 'y']:
-                    target_member = found_match
-                else:
-                    await ctx.send("💬 Mencione (`@membro`) ou envie o ID do membro do Discord:")
-                    msg_target = await bot.wait_for('message', check=check_author, timeout=30.0)
-                    if msg_target.mentions:
-                        target_member = msg_target.mentions[0]
-                    elif msg_target.content.strip().isdigit():
-                        fetched = ctx.guild.get_member(int(msg_target.content.strip()))
-                        if fetched:
-                            target_member = fetched
-            except asyncio.TimeoutError:
-                await ctx.send("⏰ Tempo esgotado! Processo cancelado.")
-                return
-
-    set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
-    await ctx.send(f"🎉 **Vinculação registrada na nuvem!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
+    set_mapping(acc_id, real_nick, target_member.id, str(target_member))
+    await ctx.send(f"🎉 **Vínculo criado!** 🎮 `{real_nick}` ➔ 💬 {target_member.mention}")
 
 @bot.command(name="vinculados")
 async def vinculados(ctx):
     """Lista todos os vínculos salvos no MongoDB."""
     mappings = get_all_mappings()
     if not mappings:
-        await ctx.send("ℹ️ Nenhum jogador está vinculado até o momento.")
+        await ctx.send("ℹ️ Nenhum vínculo cadastrado.")
         return
 
-    msg = "**📋 Lista de Jogadores Vinculados:**\n"
-    for data in mappings:
-        msg += f"• `{data['account_name']}` ➔ <@{data['discord_user_id']}>\n"
+    msg = "**📋 Jogadores Vinculados:**\n"
+    for item in mappings:
+        msg += f"• `{item['account_name']}` ➔ <@{item['discord_user_id']}>\n"
 
-    if len(msg) > 2000:
-        chunks = [msg[i:i+1900] for i in range(0, len(msg), 1900)]
-        for chunk in chunks:
-            await ctx.send(chunk)
-    else:
-        await ctx.send(msg)
+    await ctx.send(msg)
 
 @bot.command(name="desvincular")
 @commands.has_permissions(administrator=True)
 async def desvincular(ctx, target: str = None):
-    """Remove o vínculo de um jogador do banco de dados."""
+    """Remove um vínculo."""
     if not target:
-        await ctx.send("❓ Mencione o usuário (`@membro`) ou digite o `Nick no Jogo` que deseja remover.")
+        await ctx.send("❓ Uso: `!desvincular @membro` ou `!desvincular NickDoJogo`")
         return
 
     removed = False
     if ctx.message.mentions:
-        target_discord_id = ctx.message.mentions[0].id
-        removed = remove_mapping_by_discord(target_discord_id)
+        removed = remove_mapping_by_discord(ctx.message.mentions[0].id)
     else:
         removed = remove_mapping_by_nick(target)
 
     if removed:
-        await ctx.send("✅ Vínculo removido do banco de dados na nuvem!")
+        await ctx.send("✅ Vínculo removido do banco de dados!")
     else:
-        await ctx.send("❌ Vínculo não encontrado no banco de dados.")
+        await ctx.send("❌ Vínculo não encontrado.")
 
-@bot.command(name="ajuda")
-async def ajuda(ctx):
-    """Exibe os comandos do bot."""
-    embed = discord.Embed(
-        title="🤖 Comandos de Gestão do Clã",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="`!vincular [NICK]`", value="Vincula sua conta do jogo ao perfil do Discord.", inline=False)
-    embed.add_field(name="`!vinculados`", value="Lista todos os membros salvos.", inline=False)
-    embed.add_field(name="`!setcla [TAG]`", value="(Admin) Configura o clã ativo do servidor.", inline=False)
-    embed.add_field(name="`!desvincular [@membro/Nick]`", value="(Admin) Remove um vínculo.", inline=False)
-    await ctx.send(embed=embed)
-
-# --- Execução do Bot ---
 bot.run(DISCORD_TOKEN)
