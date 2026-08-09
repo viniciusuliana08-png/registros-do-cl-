@@ -45,9 +45,16 @@ def init_db():
             channel_id INTEGER,
             panel_message_id INTEGER,
             online_panel_message_id INTEGER,
-            last_members TEXT
+            last_members TEXT,
+            absent_channel_id INTEGER
         )
     ''')
+    
+    # Adiciona a coluna absent_channel_id caso o banco já existisse antes
+    try:
+        cursor.execute("ALTER TABLE server_clans ADD COLUMN absent_channel_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
     
     conn.commit()
     conn.close()
@@ -60,6 +67,17 @@ def set_server_clan(guild_id: int, clan_tag: str):
         VALUES (?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET clan_tag=excluded.clan_tag
     ''', (guild_id, clan_tag.upper()))
+    conn.commit()
+    conn.close()
+
+def set_absent_channel(guild_id: int, channel_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE server_clans 
+        SET absent_channel_id = ? 
+        WHERE guild_id = ?
+    ''', (channel_id, guild_id))
     conn.commit()
     conn.close()
 
@@ -99,7 +117,7 @@ def update_last_members(guild_id: int, member_ids_str: str):
 def get_server_config(guild_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('SELECT clan_tag, channel_id, panel_message_id, online_panel_message_id, last_members FROM server_clans WHERE guild_id = ?', (guild_id,))
+    cursor.execute('SELECT clan_tag, channel_id, panel_message_id, online_panel_message_id, last_members, absent_channel_id FROM server_clans WHERE guild_id = ?', (guild_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -108,7 +126,8 @@ def get_server_config(guild_id: int):
             'channel_id': row[1],
             'panel_message_id': row[2],
             'online_panel_message_id': row[3],
-            'last_members': row[4]
+            'last_members': row[4],
+            'absent_channel_id': row[5]
         }
     return None
 
@@ -158,28 +177,21 @@ APPLICATION_ID = os.environ.get("APPLICATION_ID")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 def get_role_badge(role: str) -> str:
-    """Mapeia todos os identificadores de cargos da Wargaming API."""
     if not role:
         return ""
     
     r = str(role).lower().strip()
     
-    # Líder / Comandante
     if r in ['leader', 'commander', 'clan_commander', 'leader_clan']:
         return " 👑 [Líder]"
-    
-    # Vice-Líder / Executive Officer / Co-Líder
     elif r in ['executive_officer', 'vice_leader', 'co_leader', 'deputy_commander', 'sub_commander']:
         return " ⚔️ [Vice-Líder]"
-        
-    # Outros Oficiais
     elif r in ['commander_assistant', 'recruiter', 'diplomat', 'quartermaster', 'personnel_officer', 'combat_officer']:
         return " 📜 [Oficial]"
         
     return ""
 
 async def fetch_clan_members(target_tag: str):
-    """Busca membros do clã, cargos e datas de batalha na Wargaming API."""
     regions = [
         "https://api.wotblitz.com",
         "https://api.wotblitz.eu",
@@ -270,7 +282,6 @@ async def fetch_clan_members(target_tag: str):
     return None, []
 
 def build_clan_embed(tag, in_game_members):
-    """Constrói o embed com formatação avançada (Cargos + Inativos + Mapeamento)."""
     mappings = get_all_mappings()
     
     em_ambos = []
@@ -332,7 +343,6 @@ def build_clan_embed(tag, in_game_members):
     return embed
 
 def build_online_embed(tag, in_game_members):
-    """Gera um painel com membros ativos recentemente (Últimas 2 horas)."""
     now = datetime.now()
     recent_activity = []
     
@@ -361,11 +371,43 @@ def build_online_embed(tag, in_game_members):
     embed.set_footer(text=f"Atualizado em tempo real às {now_str} • Atualiza a cada 5 minutos.")
     return embed
 
+async def send_inactivity_warning(guild, in_game_members):
+    """Envia as notificações de inatividade para o canal configurado de ausentes."""
+    config = get_server_config(guild.id)
+    if not config or not config.get('absent_channel_id'):
+        return
+
+    absent_channel = guild.get_channel(config['absent_channel_id'])
+    if not absent_channel:
+        return
+
+    mappings = get_all_mappings()
+    inactives = [m for m in in_game_members if m['is_inactive_30d']]
+    
+    if not inactives:
+        return
+
+    unlinked_inactives = []
+
+    for m in inactives:
+        acc_id = m['account_id']
+        acc_name = m['account_name']
+        
+        if acc_id in mappings:
+            discord_id = mappings[acc_id]['discord_id']
+            msg = f"<@{discord_id}> você está ha um mês sem jogar, por favor para não considerarmos um jogador inativo jogue uma unica batalha no modo REGULAR, obrigado pela atenção"
+            await absent_channel.send(msg)
+        else:
+            unlinked_inactives.append(acc_name)
+
+    if unlinked_inactives:
+        list_str = ", ".join(f"**{nick}**" for nick in unlinked_inactives)
+        await absent_channel.send(f"⚠️ **Jogadores inativos há +30 dias sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular @Membro Nick` para vinculá-los)*")
+
 # --- 4. TAREFAS AUTOMÁTICAS ---
 
 @tasks.loop(hours=1)
 async def auto_update_job():
-    """Atualização geral de 1 em 1 hora."""
     guild_ids = get_all_configured_servers()
     for g_id in guild_ids:
         config = get_server_config(g_id)
@@ -403,7 +445,6 @@ async def auto_update_job():
 
 @tasks.loop(minutes=5)
 async def fast_online_update_job():
-    """Atualização do Painel Online a cada 5 minutos."""
     guild_ids = get_all_configured_servers()
     for g_id in guild_ids:
         config = get_server_config(g_id)
@@ -441,15 +482,20 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setcla(ctx, tag: str):
-    """[Admin] Define a TAG do clã para este servidor."""
     clean_tag = tag.strip().upper()
     set_server_clan(ctx.guild.id, clean_tag)
-    await ctx.send(f"✅ **Clã configurado!** TAG: **[{clean_tag}]**.\nUse `!painel` ou `!painelonline` nos canais desejados.")
+    await ctx.send(f"✅ **Clã configurado!** TAG: **[{clean_tag}]**.\nUse `!setausentes #canal` para definir o canal de avisos de ausência.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setausentes(ctx, channel: discord.TextChannel):
+    """[Admin] Define o canal onde os avisos de ausência/inatividade serão enviados."""
+    set_absent_channel(ctx.guild.id, channel.id)
+    await ctx.send(f"✅ **Canal dos Ausentes configurado:** {channel.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def painel(ctx):
-    """[Admin] Cria o painel principal (atualizado de 1 em 1 hora)."""
     config = get_server_config(ctx.guild.id)
     if not config or not config['clan_tag']:
         await ctx.send("⚠️ NENHUM CLÃ CONFIGURADO! Use `!setcla SUA_TAG` primeiro.")
@@ -469,12 +515,15 @@ async def painel(ctx):
     
     current_ids_str = ",".join(str(m['account_id']) for m in in_game_members)
     update_last_members(ctx.guild.id, current_ids_str)
+    
+    # Envia os avisos para o canal de ausentes
+    await send_inactivity_warning(ctx.guild, in_game_members)
+    
     await ctx.send("📌 **Painel Principal fixado com sucesso!**", delete_after=10)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def painelonline(ctx):
-    """[Admin] Cria o painel de atividade recente (atualizado a cada 5 minutos)."""
     config = get_server_config(ctx.guild.id)
     if not config or not config['clan_tag']:
         await ctx.send("⚠️ NENHUM CLÃ CONFIGURADO! Use `!setcla SUA_TAG` primeiro.")
@@ -496,7 +545,6 @@ async def painelonline(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def vincular(ctx, member: discord.Member, *, nickname_jogo: str):
-    """[Admin] Vincula um membro do Discord à conta do jogo."""
     loading = await ctx.send(f"🔍 Buscando jogador **{nickname_jogo}**...")
     async with aiohttp.ClientSession() as session:
         regions = ["https://api.wotblitz.com", "https://api.wotblitz.eu"]
@@ -525,14 +573,12 @@ async def vincular(ctx, member: discord.Member, *, nickname_jogo: str):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def desvincular(ctx, member: discord.Member):
-    """[Admin] Remove a vinculação de um membro."""
     remove_mapping(member.id)
     await ctx.send(f"🗑️ Vinculação do membro {member.mention} foi removida!")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def vinculados(ctx):
-    """[Admin] Lista todos os membros vinculados no banco."""
     mappings = get_all_mappings()
     if not mappings:
         await ctx.send("ℹ️ Nenhum membro vinculado ainda.")
@@ -543,7 +589,6 @@ async def vinculados(ctx):
 
 @bot.command()
 async def membros(ctx):
-    """Envia a lista no chat imediatamente."""
     config = get_server_config(ctx.guild.id)
     if not config or not config['clan_tag']:
         await ctx.send("⚠️ NENHUM CLÃ CONFIGURADO! Use `!setcla SUA_TAG`")
@@ -557,6 +602,9 @@ async def membros(ctx):
 
     embed = build_clan_embed(tag, in_game_members)
     await loading_msg.edit(content="", embed=embed)
+    
+    # Envia os avisos para o canal de ausentes
+    await send_inactivity_warning(ctx.guild, in_game_members)
 
 keep_alive()
 bot.run(DISCORD_TOKEN)
