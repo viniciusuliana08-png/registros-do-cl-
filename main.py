@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import asyncio
+import difflib
 import aiohttp
 import discord
 from discord.ext import commands, tasks
@@ -50,7 +52,6 @@ def init_db():
         )
     ''')
     
-    # Adiciona a coluna absent_channel_id caso o banco já existisse antes
     try:
         cursor.execute("ALTER TABLE server_clans ADD COLUMN absent_channel_id INTEGER")
     except sqlite3.OperationalError:
@@ -372,7 +373,6 @@ def build_online_embed(tag, in_game_members):
     return embed
 
 async def send_inactivity_warning(guild, in_game_members):
-    """Envia as notificações de inatividade para o canal configurado de ausentes."""
     config = get_server_config(guild.id)
     if not config or not config.get('absent_channel_id'):
         return
@@ -402,7 +402,7 @@ async def send_inactivity_warning(guild, in_game_members):
 
     if unlinked_inactives:
         list_str = ", ".join(f"**{nick}**" for nick in unlinked_inactives)
-        await absent_channel.send(f"⚠️ **Jogadores inativos há +30 dias sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular @Membro Nick` para vinculá-los)*")
+        await absent_channel.send(f"⚠️ **Jogadores inativos há +30 dias sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular` para vinculá-los)*")
 
 # --- 4. TAREFAS AUTOMÁTICAS ---
 
@@ -489,7 +489,6 @@ async def setcla(ctx, tag: str):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setausentes(ctx, channel: discord.TextChannel):
-    """[Admin] Define o canal onde os avisos de ausência/inatividade serão enviados."""
     set_absent_channel(ctx.guild.id, channel.id)
     await ctx.send(f"✅ **Canal dos Ausentes configurado:** {channel.mention}")
 
@@ -516,9 +515,7 @@ async def painel(ctx):
     current_ids_str = ",".join(str(m['account_id']) for m in in_game_members)
     update_last_members(ctx.guild.id, current_ids_str)
     
-    # Envia os avisos para o canal de ausentes
     await send_inactivity_warning(ctx.guild, in_game_members)
-    
     await ctx.send("📌 **Painel Principal fixado com sucesso!**", delete_after=10)
 
 @bot.command()
@@ -544,31 +541,112 @@ async def painelonline(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def vincular(ctx, member: discord.Member, *, nickname_jogo: str):
-    loading = await ctx.send(f"🔍 Buscando jogador **{nickname_jogo}**...")
+async def vincular(ctx):
+    """[Admin] Processo interativo de vinculação baseado na lista do servidor Discord."""
+    def check_author(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    # PASSO 1: Perguntar Nick no Jogo
+    await ctx.send("🎮 **Qual é o Nick do jogador no WOTB?**")
+    try:
+        msg_game = await bot.wait_for('message', check=check_author, timeout=40.0)
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ **Tempo esgotado!** Processo de vinculação cancelado.")
+        return
+
+    game_nick = msg_game.content.strip()
+    
+    # Busca na API Wargaming
     async with aiohttp.ClientSession() as session:
-        regions = ["https://api.wotblitz.com", "https://api.wotblitz.eu"]
+        regions = ["https://api.wotblitz.com", "https://api.wotblitz.eu", "https://api.wotblitz.asia"]
         acc_id = None
-        real_nick = nickname_jogo
+        real_game_nick = game_nick
         for reg in regions:
-            url = f"{reg}/wotb/account/list/?application_id={APPLICATION_ID}&search={nickname_jogo}"
+            url = f"{reg}/wotb/account/list/?application_id={APPLICATION_ID}&search={game_nick}"
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data.get('data'):
-                            acc_id = data['data'][0]['account_id']
-                            real_nick = data['data'][0]['nickname']
+                            for player in data['data']:
+                                if player['nickname'].lower() == game_nick.lower():
+                                    acc_id = player['account_id']
+                                    real_game_nick = player['nickname']
+                                    break
+                            if not acc_id and data['data']:
+                                acc_id = data['data'][0]['account_id']
+                                real_game_nick = data['data'][0]['nickname']
                             break
             except Exception:
                 pass
-                
-        if not acc_id:
-            await loading.edit(content=f"❌ Jogador **{nickname_jogo}** não encontrado.")
+
+    if not acc_id:
+        await ctx.send(f"❌ Não encontrei nenhum jogador com o nick **{game_nick}** no WOTB. Processo cancelado.")
+        return
+
+    # BUSCA INTELIGENTE NA LISTA DE MEMBROS DO DISCORD DA GUILD
+    clean_game_nick = real_game_nick.lower()
+    
+    # Mapeia nomes do discord e apelidos no servidor para os objetos de membros
+    members_map = {}
+    for member in ctx.guild.members:
+        members_map[member.name.lower()] = member
+        members_map[member.display_name.lower()] = member
+
+    target_member = None
+
+    # Tenta encontrar correspondência exata primeiro ou mais próxima na lista do Discord
+    if clean_game_nick in members_map:
+        target_member = members_map[clean_game_nick]
+    else:
+        # Procura por semelhança usando os nomes dos membros do servidor Discord
+        all_discord_names = list(members_map.keys())
+        matches = difflib.get_close_matches(clean_game_nick, all_discord_names, n=1, cutoff=0.45)
+        if matches:
+            target_member = members_map[matches[0]]
+
+    # PERGUNTA BASEADA NO QUE FOI ENCONTRADO NO SERVIDOR
+    if target_member:
+        await ctx.send(
+            f"🔎 Encontrei o jogador **{real_game_nick}** na Wargaming.\n"
+            f"❓ Analisando a lista do servidor, esse jogador é o membro {target_member.mention}? *(Responda 'sim' ou 'nao')*"
+        )
+        try:
+            msg_confirm = await bot.wait_for('message', check=check_author, timeout=25.0)
+            if msg_confirm.content.strip().lower() not in ['s', 'sim', 'yes', 'y']:
+                target_member = None  # Respondeu 'não', prossegue para seleção manual
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Tempo esgotado. Processo cancelado.")
             return
 
-        set_mapping(acc_id, real_nick, member.id, str(member))
-        await loading.edit(content=f"✅ Sucesso! {member.mention} foi vinculado à conta **{real_nick}**.")
+    # SE NÃO ENCONTROU OU RESPINDEU 'NÃO', PEDE PARA ESPECIFICAR O MEMBRO
+    if not target_member:
+        await ctx.send("💬 Por favor, mencione (`@membro`), digite o Nome/Apelido exato ou o ID do membro do Discord:")
+        try:
+            msg_discord = await bot.wait_for('message', check=check_author, timeout=40.0)
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ **Tempo esgotado!** Processo de vinculação cancelado.")
+            return
+
+        input_user = msg_discord.content.strip()
+
+        if msg_discord.mentions:
+            target_member = msg_discord.mentions[0]
+        elif input_user.isdigit():
+            target_member = ctx.guild.get_member(int(input_user))
+
+        if not target_member:
+            clean_input = input_user.lstrip('@').lower()
+            if clean_input in members_map:
+                target_member = members_map[clean_input]
+
+    if not target_member:
+        await ctx.send(f"❌ Não foi possível encontrar nenhum membro no servidor referente a essa resposta.")
+        return
+
+    # Salva no banco de dados
+    set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
+    await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -603,7 +681,6 @@ async def membros(ctx):
     embed = build_clan_embed(tag, in_game_members)
     await loading_msg.edit(content="", embed=embed)
     
-    # Envia os avisos para o canal de ausentes
     await send_inactivity_warning(ctx.guild, in_game_members)
 
 keep_alive()
