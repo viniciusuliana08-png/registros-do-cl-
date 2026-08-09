@@ -1,6 +1,5 @@
 import os
 import asyncio
-import difflib
 import traceback
 import aiohttp
 import discord
@@ -11,7 +10,8 @@ import certifi
 
 # --- Configurações de Variáveis de Ambiente ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-WARGAMING_APP_ID = os.getenv("WARGAMING_APP_ID", "demo")
+# Atualizado para buscar a variável APPLICATION_ID
+APPLICATION_ID = os.getenv("APPLICATION_ID") or os.getenv("WARGAMING_APP_ID", "demo")
 MONGO_URI = os.getenv("MONGO_URI")
 
 # --- Conexão com o Banco de Dados MongoDB ---
@@ -20,7 +20,7 @@ try:
     db = mongo_client["wotb_bot_db"]
     servers_col = db["servers"]
     mappings_col = db["mappings"]
-    print("✅ Conexão com o MongoDB estabelecida!")
+    print("✅ Conexão com o MongoDB estabelecida com sucesso!")
 except Exception as e:
     print(f"❌ Erro ao conectar ao MongoDB: {e}")
 
@@ -77,7 +77,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # --- Servidor HTTP (Health Check do Render) ---
 
 async def handle_ping(request):
-    return web.Response(text="Bot On!")
+    return web.Response(text="Bot Online no Render!")
 
 async def start_web_server():
     app = web.Application()
@@ -89,48 +89,49 @@ async def start_web_server():
     await site.start()
     print(f"🌐 Servidor Web rodando na porta {port}")
 
-# --- Integração API Wargaming ---
+# --- API Wargaming NA ---
 
 async def fetch_clan_id_by_tag(tag):
     clean_tag = str(tag).strip().replace("[", "").replace("]", "").replace("–", "-").replace("—", "-")
-    app_id = WARGAMING_APP_ID or "demo"
     url = "https://api.wotblitz.com/wotb/clans/list/"
     
     params = {
-        "application_id": str(app_id),
+        "application_id": str(APPLICATION_ID),
         "search": clean_tag
     }
     
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("status") == "ok" and data.get("data"):
-                    # Tenta achar correspondência exata de tag
-                    for clan in data["data"]:
-                        if clan.get("tag", "").lower().replace("-", "") == clean_tag.lower().replace("-", ""):
-                            return clan.get("clan_id"), clan.get("tag")
-                    # Se não achar exato, pega a primeira opção retornada
-                    first_clan = data["data"][0]
-                    return first_clan.get("clan_id"), first_clan.get("tag")
-            return None, None
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("status") == "error":
+                        error_info = data.get("error", {})
+                        print(f"⚠️ Erro API Wargaming: {error_info}")
+                        return None, None, f"API Error: {error_info.get('message', 'Erro na API')}"
 
-async def fetch_clan_members(tag_or_id):
-    clan_id = None
-    clan_tag = None
+                    if data.get("status") == "ok" and data.get("data"):
+                        target_normalized = clean_tag.lower().replace("-", "")
+                        
+                        # Busca por correspondência exata de TAG
+                        for clan in data["data"]:
+                            clan_tag_api = clan.get("tag", "").strip()
+                            if clan_tag_api.lower().replace("-", "") == target_normalized:
+                                return clan.get("clan_id"), clan_tag_api, None
+                        
+                        first_clan = data["data"][0]
+                        return first_clan.get("clan_id"), first_clan.get("tag"), None
+                else:
+                    return None, None, f"HTTP {resp.status}"
+        except Exception as e:
+            return None, None, str(e)
+            
+    return None, None, "Clã não encontrado"
 
-    if str(tag_or_id).isdigit():
-        clan_id = int(tag_or_id)
-    else:
-        clan_id, clan_tag = await fetch_clan_id_by_tag(str(tag_or_id))
-
-    if not clan_id:
-        return None, []
-
-    app_id = WARGAMING_APP_ID or "demo"
+async def fetch_clan_members(clan_id):
     url = "https://api.wotblitz.com/wotb/clans/info/"
     params = {
-        "application_id": str(app_id),
+        "application_id": str(APPLICATION_ID),
         "clan_id": str(clan_id),
         "extra": "members"
     }
@@ -141,7 +142,7 @@ async def fetch_clan_members(tag_or_id):
                 data = await resp.json()
                 if data.get("status") == "ok" and data.get("data") and str(clan_id) in data["data"]:
                     clan_info = data["data"][str(clan_id)]
-                    tag = clan_info.get("tag", clan_tag)
+                    tag = clan_info.get("tag")
                     members_dict = clan_info.get("members", {})
                     
                     members_list = []
@@ -154,18 +155,17 @@ async def fetch_clan_members(tag_or_id):
                     return tag, members_list
             return None, []
 
-# --- Eventos e Tratamento de Erros ---
+# --- Eventos do Bot ---
 
 @bot.event
 async def on_ready():
     await start_web_server()
-    print(f"✅ Bot conectado como: {bot.user}")
+    print(f"✅ Bot online como: {bot.user}")
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    # Garante que os comandos ! sejam processados corretamente
     await bot.process_commands(message)
 
 @bot.event
@@ -183,39 +183,43 @@ async def on_command_error(ctx, error):
 @bot.command(name="setcla")
 @commands.has_permissions(administrator=True)
 async def setcla(ctx, *, tag: str = None):
-    """Configura o clã para o servidor."""
+    """Configura a TAG do clã para o servidor."""
     if not tag:
         await ctx.send("⚙️ Digite a TAG do clã. Exemplo: `!setcla MR-S`")
         return
 
-    loading = await ctx.send(f"🔎 Buscando clã `[{tag}]` na Wargaming...")
-    clan_id, real_tag = await fetch_clan_id_by_tag(tag)
+    loading = await ctx.send(f"🔎 Buscando clã `[{tag}]` no servidor NA da Wargaming...")
+    clan_id, real_tag, err = await fetch_clan_id_by_tag(tag)
 
     try:
         await loading.delete()
     except Exception:
         pass
 
+    if err:
+        await ctx.send(f"❌ Falha na Wargaming: `{err}`")
+        return
+
     if not clan_id:
-        await ctx.send(f"❌ Não foi possível encontrar o clã com a TAG `[{tag}]` na Wargaming.")
+        await ctx.send(f"❌ Clã `[{tag}]` não foi encontrado no servidor NA.")
         return
 
     set_server_config(ctx.guild.id, real_tag, clan_id)
-    await ctx.send(f"✅ Clã **[{real_tag}]** (ID: `{clan_id}`) configurado e salvo no banco de dados!")
+    await ctx.send(f"✅ Clã **[{real_tag}]** (ID: `{clan_id}`) configurado com sucesso!")
 
 @bot.command(name="vincular")
 async def vincular(ctx, *, nick_direto: str = None):
-    """Vincula o nick do jogador no WOTB com a conta do Discord."""
+    """Vincula a conta do jogo ao Discord."""
     config = get_server_config(ctx.guild.id)
-    if not config or not config.get('clan_tag'):
-        await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
+    if not config or not config.get('clan_id'):
+        await ctx.send("⚠️ Nenhum clã configurado neste servidor. Um administrador precisa rodar `!setcla TAG` primeiro.")
         return
 
     def check_author(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
     if not nick_direto:
-        await ctx.send("🎮 Qual seu nick no jogo?")
+        await ctx.send("🎮 Qual seu Nick no jogo?")
         try:
             msg = await bot.wait_for('message', check=check_author, timeout=30.0)
             search_nick = msg.content.strip().lower()
@@ -225,8 +229,8 @@ async def vincular(ctx, *, nick_direto: str = None):
     else:
         search_nick = nick_direto.strip().lower()
 
-    loading = await ctx.send("🔎 Procurando no clã...")
-    tag, members = await fetch_clan_members(config['clan_tag'])
+    loading = await ctx.send("🔎 Procurando jogador na lista do clã...")
+    tag, members = await fetch_clan_members(config['clan_id'])
 
     try:
         await loading.delete()
@@ -234,7 +238,7 @@ async def vincular(ctx, *, nick_direto: str = None):
         pass
 
     if not members:
-        await ctx.send("❌ Não foi possível carregar a lista de membros do clã.")
+        await ctx.send("❌ Não foi possível carregar os membros do clã.")
         return
 
     matches = [m for m in members if search_nick in m['account_name'].lower()]
@@ -249,14 +253,14 @@ async def vincular(ctx, *, nick_direto: str = None):
 
     target_member = ctx.author
     set_mapping(acc_id, real_nick, target_member.id, str(target_member))
-    await ctx.send(f"🎉 **Vínculo criado!** 🎮 `{real_nick}` ➔ 💬 {target_member.mention}")
+    await ctx.send(f"🎉 **Vínculo realizado!** 🎮 `{real_nick}` ➔ 💬 {target_member.mention}")
 
 @bot.command(name="vinculados")
 async def vinculados(ctx):
-    """Lista todos os vínculos salvos no MongoDB."""
+    """Lista todos os cadastros no banco de dados."""
     mappings = get_all_mappings()
     if not mappings:
-        await ctx.send("ℹ️ Nenhum vínculo cadastrado.")
+        await ctx.send("ℹ️ Nenhum registro cadastrado no momento.")
         return
 
     msg = "**📋 Jogadores Vinculados:**\n"
@@ -268,7 +272,7 @@ async def vinculados(ctx):
 @bot.command(name="desvincular")
 @commands.has_permissions(administrator=True)
 async def desvincular(ctx, target: str = None):
-    """Remove um vínculo."""
+    """Remove um registro do banco de dados."""
     if not target:
         await ctx.send("❓ Uso: `!desvincular @membro` ou `!desvincular NickDoJogo`")
         return
@@ -280,8 +284,8 @@ async def desvincular(ctx, target: str = None):
         removed = remove_mapping_by_nick(target)
 
     if removed:
-        await ctx.send("✅ Vínculo removido do banco de dados!")
+        await ctx.send("✅ Vínculo removido!")
     else:
-        await ctx.send("❌ Vínculo não encontrado.")
+        await ctx.send("❌ Registro não encontrado.")
 
 bot.run(DISCORD_TOKEN)
