@@ -1,207 +1,142 @@
 import os
-import sqlite3
 import asyncio
 import difflib
 import aiohttp
 import discord
+import motor.motor_asyncio
 from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Fuso horário de Brasília
+# --- 1. CONFIGURAÇÕES E FUSO HORÁRIO ---
 TIMEZONE_BR = ZoneInfo("America/Sao_Paulo")
 
 def now_br():
     return datetime.now(TIMEZONE_BR)
 
-# --- 1. SERVIDOR WEB (FLASK) ---
+APPLICATION_ID = os.environ.get("APPLICATION_ID")
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
+
+# --- 2. SERVIDOR WEB (FLASK FOR KEEP-ALIVE) ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot do Clã online!"
+    return "Bot do Clã Online (MongoDB)!"
 
-def run():
+def run_flask():
     port = int(os.environ.get("PORT", 10002))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run, daemon=True)
+    t = Thread(target=run_flask, daemon=True)
     t.start()
 
-# --- 2. BANCO DE DADOS ---
-DB_NAME = "clan_manager.db"
+# --- 3. BANCO DE DADOS (MONGODB / MOTOR) ---
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["clan_manager_db"]
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS clan_mappings_v2 (
-            discord_id INTEGER PRIMARY KEY,
-            account_id INTEGER,
-            account_name TEXT,
-            discord_name TEXT
-        )
-    ''')
+mappings_col = db["mappings"]
+servers_col = db["servers"]
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS server_clans (
-            guild_id INTEGER PRIMARY KEY,
-            clan_tag TEXT,
-            channel_id INTEGER,
-            panel_message_id INTEGER,
-            online_panel_message_id INTEGER,
-            last_members TEXT,
-            absent_channel_id INTEGER
-        )
-    ''')
-    
-    try:
-        cursor.execute("ALTER TABLE server_clans ADD COLUMN absent_channel_id INTEGER")
-    except sqlite3.OperationalError:
-        pass
-    
-    conn.commit()
-    conn.close()
+async def set_server_clan(guild_id: int, clan_tag: str):
+    await servers_col.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"clan_tag": clan_tag.upper()}},
+        upsert=True
+    )
 
-def set_server_clan(guild_id: int, clan_tag: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO server_clans (guild_id, clan_tag)
-        VALUES (?, ?)
-        ON CONFLICT(guild_id) DO UPDATE SET clan_tag=excluded.clan_tag
-    ''', (guild_id, clan_tag.upper()))
-    conn.commit()
-    conn.close()
+async def set_absent_channel(guild_id: int, channel_id: int):
+    await servers_col.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"absent_channel_id": channel_id}},
+        upsert=True
+    )
 
-def set_absent_channel(guild_id: int, channel_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE server_clans SET absent_channel_id = ? WHERE guild_id = ?
-    ''', (channel_id, guild_id))
-    conn.commit()
-    conn.close()
+async def remove_absent_channel(guild_id: int):
+    await servers_col.update_one(
+        {"guild_id": guild_id},
+        {"$unset": {"absent_channel_id": ""}}
+    )
 
-def set_server_panel(guild_id: int, channel_id: int, message_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE server_clans SET channel_id = ?, panel_message_id = ? WHERE guild_id = ?
-    ''', (channel_id, message_id, guild_id))
-    conn.commit()
-    conn.close()
+async def set_server_panel(guild_id: int, channel_id: int, message_id: int):
+    await servers_col.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"channel_id": channel_id, "panel_message_id": message_id}},
+        upsert=True
+    )
 
-def set_online_panel(guild_id: int, channel_id: int, message_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE server_clans SET channel_id = ?, online_panel_message_id = ? WHERE guild_id = ?
-    ''', (channel_id, message_id, guild_id))
-    conn.commit()
-    conn.close()
+async def set_online_panel(guild_id: int, channel_id: int, message_id: int):
+    await servers_col.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"channel_id": channel_id, "online_panel_message_id": message_id}},
+        upsert=True
+    )
 
-def update_last_members(guild_id: int, member_ids_str: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE server_clans SET last_members = ? WHERE guild_id = ?
-    ''', (member_ids_str, guild_id))
-    conn.commit()
-    conn.close()
+async def update_last_members(guild_id: int, member_ids_str: str):
+    await servers_col.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"last_members": member_ids_str}},
+        upsert=True
+    )
 
-def get_server_config(guild_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT clan_tag, channel_id, panel_message_id, online_panel_message_id, last_members, absent_channel_id FROM server_clans WHERE guild_id = ?', (guild_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {
-            'clan_tag': row[0],
-            'channel_id': row[1],
-            'panel_message_id': row[2],
-            'online_panel_message_id': row[3],
-            'last_members': row[4],
-            'absent_channel_id': row[5]
-        }
-    return None
+async def get_server_config(guild_id: int):
+    return await servers_col.find_one({"guild_id": guild_id})
 
-def get_all_configured_servers():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT guild_id FROM server_clans WHERE clan_tag IS NOT NULL')
-    rows = cursor.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+async def get_all_configured_servers():
+    cursor = servers_col.find({"clan_tag": {"$ne": None}})
+    servers = await cursor.to_list(length=None)
+    return [s["guild_id"] for s in servers]
 
-def set_mapping(account_id: int, account_name: str, discord_id: int, discord_name: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO clan_mappings_v2 (discord_id, account_id, account_name, discord_name)
-        VALUES (?, ?, ?, ?)
-    ''', (discord_id, account_id, account_name, discord_name))
-    conn.commit()
-    conn.close()
+async def set_mapping(account_id: int, account_name: str, discord_id: int, discord_name: str):
+    await mappings_col.update_one(
+        {"discord_id": discord_id},
+        {"$set": {
+            "account_id": account_id,
+            "account_name": account_name,
+            "discord_name": discord_name
+        }},
+        upsert=True
+    )
 
-def update_account_nickname_by_id(account_id: int, new_account_name: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE clan_mappings_v2
-        SET account_name = ?
-        WHERE account_id = ?
-    ''', (new_account_name, account_id))
-    conn.commit()
-    conn.close()
+async def update_account_nickname_by_id(account_id: int, new_account_name: str):
+    await mappings_col.update_many(
+        {"account_id": account_id},
+        {"$set": {"account_name": new_account_name}}
+    )
 
-def remove_mapping(discord_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM clan_mappings_v2 WHERE discord_id = ?', (discord_id,))
-    conn.commit()
-    conn.close()
+async def remove_mapping(discord_id: int):
+    await mappings_col.delete_one({"discord_id": discord_id})
 
-def get_all_mappings():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT account_id, account_name, discord_id, discord_name FROM clan_mappings_v2')
-    rows = cursor.fetchall()
-    conn.close()
+async def get_all_mappings():
+    cursor = mappings_col.find({})
+    docs = await cursor.to_list(length=None)
     
     mappings = {}
-    for row in rows:
-        acc_id = row[0]
+    for doc in docs:
+        acc_id = doc["account_id"]
         if acc_id not in mappings:
             mappings[acc_id] = []
         mappings[acc_id].append({
-            'acc_name': row[1],
-            'discord_id': row[2],
-            'discord_name': row[3]
+            'acc_name': doc["account_name"],
+            'discord_id': doc["discord_id"],
+            'discord_name': doc.get("discord_name", "")
         })
     return mappings
 
-init_db()
-
-# --- 3. CONFIGURAÇÕES DO BOT ---
+# --- 4. CONFIGURAÇÃO DO BOT ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-APPLICATION_ID = os.environ.get("APPLICATION_ID")
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-
 def get_role_info(role: str):
     if not role:
         return 99, ""
-    
     r = str(role).lower().strip()
     if r in ['leader', 'commander', 'clan_commander', 'leader_clan']:
         return 1, " 👑 `Líder`"
@@ -209,7 +144,6 @@ def get_role_info(role: str):
         return 2, " ⚔️ `Vice-Líder`"
     elif r in ['commander_assistant', 'recruiter', 'diplomat', 'quartermaster', 'personnel_officer', 'combat_officer']:
         return 3, " 📜 `Oficial`"
-        
     return 4, ""
 
 async def fetch_clan_members(target_tag: str):
@@ -312,8 +246,8 @@ def format_ts_discord(ts: int) -> str:
         return "❌ *Sem registros*"
     return f"<t:{ts}:f>"
 
-def build_clan_embed(tag, in_game_members):
-    mappings = get_all_mappings()
+async def build_clan_embed(tag, in_game_members):
+    mappings = await get_all_mappings()
     
     em_ambos = []
     apenas_jogo = []
@@ -372,7 +306,7 @@ def build_clan_embed(tag, in_game_members):
         add_safe_fields(embed, "⚠️ Inativos Há Mais de 30 Dias", inativos_30d)
     
     embed.set_footer(text="Auto-atualiza de hora em hora • Horário de Brasília")
-    embed.timestamp = datetime.now(TIMEZONE_BR)
+    embed.timestamp = now_br()
     return embed
 
 def build_online_embed(tag, in_game_members):
@@ -402,11 +336,11 @@ def build_online_embed(tag, in_game_members):
         embed.add_field(name="💤 Status do Clã", value="Nenhum membro esteve em batalha nas últimas 2 horas.", inline=False)
         
     embed.set_footer(text="Atualizado a cada 5 minutos • Horário de Brasília")
-    embed.timestamp = datetime.now(TIMEZONE_BR)
+    embed.timestamp = now_br()
     return embed
 
 async def send_inactivity_warning(guild, in_game_members):
-    config = get_server_config(guild.id)
+    config = await get_server_config(guild.id)
     if not config or not config.get('absent_channel_id'):
         return
 
@@ -414,7 +348,7 @@ async def send_inactivity_warning(guild, in_game_members):
     if not absent_channel:
         return
 
-    mappings = get_all_mappings()
+    mappings = await get_all_mappings()
     inactives = [m for m in in_game_members if m['is_inactive_30d']]
     
     if not inactives:
@@ -436,18 +370,17 @@ async def send_inactivity_warning(guild, in_game_members):
 
     if unlinked_inactives:
         list_str = ", ".join(f"**{nick}**" for nick in unlinked_inactives)
-        await absent_channel.send(f"⚠️ **Jogadores inativos (+30 dias) sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular` para registrá-los)*")
+        await absent_channel.send(f"⚠️ **Jogadores inativos (+30 dias) sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular NICK` para registrá-los)*")
 
-# --- 4. TAREFAS AUTOMÁTICAS ---
+# --- 5. TAREFAS AUTOMÁTICAS ---
 
 @tasks.loop(hours=1)
 async def auto_update_job():
-    guild_ids = get_all_configured_servers()
-    mappings = get_all_mappings()
+    guild_ids = await get_all_configured_servers()
 
     for g_id in guild_ids:
-        config = get_server_config(g_id)
-        if not config or not config['clan_tag']:
+        config = await get_server_config(g_id)
+        if not config or not config.get('clan_tag'):
             continue
             
         clan_tag = config['clan_tag']
@@ -456,6 +389,7 @@ async def auto_update_job():
             continue
 
         channel = bot.get_channel(config['channel_id']) if config.get('channel_id') else None
+        mappings = await get_all_mappings()
 
         for m in in_game_members:
             acc_id = m['account_id']
@@ -464,15 +398,13 @@ async def auto_update_job():
             if acc_id in mappings:
                 old_nick = mappings[acc_id][0]['acc_name']
                 if old_nick != current_nick:
-                    update_account_nickname_by_id(acc_id, current_nick)
+                    await update_account_nickname_by_id(acc_id, current_nick)
                     if channel:
                         discord_mentions = " / ".join(f"<@{d['discord_id']}>" for d in mappings[acc_id])
                         await channel.send(
                             f"✏️ **TROCA DE NICK DETECTADA:** O membro {discord_mentions} "
                             f"alterou o seu nick de `{old_nick}` para **`{current_nick}`**!"
                         )
-
-        mappings = get_all_mappings()
 
         current_ids = {m['account_id']: m['account_name'] for m in in_game_members}
         last_ids_str = config.get('last_members')
@@ -487,22 +419,22 @@ async def auto_update_job():
                 await channel.send(f"🚪 **SAÍDA:** Um jogador deixou o clã **[{tag}]**.")
 
         current_ids_str = ",".join(map(str, current_ids.keys()))
-        update_last_members(g_id, current_ids_str)
+        await update_last_members(g_id, current_ids_str)
         
         if config.get('channel_id') and config.get('panel_message_id') and channel:
             try:
                 panel_msg = await channel.fetch_message(config['panel_message_id'])
-                embed = build_clan_embed(tag, in_game_members)
+                embed = await build_clan_embed(tag, in_game_members)
                 await panel_msg.edit(embed=embed)
             except Exception as e:
                 print(f"Erro painel principal: {e}")
 
 @tasks.loop(minutes=5)
 async def fast_online_update_job():
-    guild_ids = get_all_configured_servers()
+    guild_ids = await get_all_configured_servers()
     for g_id in guild_ids:
-        config = get_server_config(g_id)
-        if not config or not config['clan_tag'] or not config.get('online_panel_message_id'):
+        config = await get_server_config(g_id)
+        if not config or not config.get('clan_tag') or not config.get('online_panel_message_id'):
             continue
             
         channel = bot.get_channel(config['channel_id'])
@@ -525,89 +457,65 @@ async def before_loops():
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot do Clã online como: {bot.user} | Horário de Brasília: {now_br().strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"✅ Bot do Clã online (MongoDB) como: {bot.user} | Brasília: {now_br().strftime('%d/%m/%Y %H:%M:%S')}")
     if not auto_update_job.is_running():
         auto_update_job.start()
     if not fast_online_update_job.is_running():
         fast_online_update_job.start()
 
-# --- 5. COMANDOS ---
+# --- 6. TRATAMENTO GLOBAL DE ERROS ---
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    print(f"Erro no comando {ctx.command}: {error}")
+    await ctx.send("⚠️ **Ocorreu um erro ao processar o comando.** Tente novamente.")
+
+# --- 7. COMANDOS ---
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setcla(ctx, tag: str):
     clean_tag = tag.strip().upper()
-    set_server_clan(ctx.guild.id, clean_tag)
+    await set_server_clan(ctx.guild.id, clean_tag)
     
     embed = discord.Embed(
         title=f"✅ Clã Configurado: [{clean_tag}]",
-        description="O clã foi associado a este servidor com sucesso.\n\n**Manual Resumido de Comandos:**",
+        description="O clã foi associado a este servidor via MongoDB.\n\n**Manual Resumido:**",
         color=0x2ECC71
     )
     embed.add_field(
         name="🛠️ Comandos Principais",
         value=(
-            "• `!setausentes #canal` ➔ Define canal para alertas de inatividade (+30d).\n"
-            "• `!painel` ➔ Cria o painel fixo do clã (auto-atualiza a cada 1 hora).\n"
-            "• `!painelonline` ➔ Cria o painel de atividade recente (auto-atualiza a cada 5 min).\n"
-            "• `!membros` ➔ Exibe a lista completa de membros na tela instantaneamente.\n"
-            "• `!vincular` ➔ Inicia o assistente para ligar conta do jogo ao Discord.\n"
-            "• `!desvincular @membro` ➔ Remove a vinculação de um usuário.\n"
-            "• `!vinculados` ➔ Lista todas as contas vinculadas do servidor.\n"
-            "• `!removerausentes` ➔ Desativa o canal de alertas de ausentes.\n"
-            "• `!ajuda` ➔ Exibe detalhes e explicações de cada função."
+            "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord em 1 passo.\n"
+            "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
+            "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
+            "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
+            "• `!vinculados` ➔ Lista todas as contas vinculadas.\n"
+            "• `!desvincular @membro` ➔ Remove vinculação."
         ),
         inline=False
     )
-    embed.set_footer(text="Horário oficial: Brasília (UTC-3)")
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def ajuda(ctx):
-    embed = discord.Embed(
-        title="📖 Guia do Bot de Gestão de Clã",
-        description="Manual de comandos e detalhes de funcionamento do bot.",
-        color=0x3498DB
-    )
-    embed.add_field(
-        name="👑 Hierarquia de Exibição",
-        value="Os membros são listados por cargo Wargaming: **Líder 👑** ➔ **Vice-Líder ⚔️** ➔ **Oficial 📜** ➔ **Membro**. Dentro do mesmo cargo, a ordenação é feita pela atividade mais recente.",
-        inline=False
-    )
-    embed.add_field(
-        name="🔗 Vincular Contas (`!vincular` / `!desvincular`)",
-        value="O `!vincular` busca o Nick exclusivamente dentro da lista do seu clã e associa ao membro no Discord.",
-        inline=False
-    )
-    embed.add_field(
-        name="⚡ Painéis Fixo e Online",
-        value="• `!painel`: Painel principal fixo com todos os membros, organizados por status no Discord.\n• `!painelonline`: Exibe apenas quem participou de batalhas nas últimas 2 horas.",
-        inline=False
-    )
-    embed.set_footer(text="Horário de Brasília (UTC-3)")
+    embed.set_footer(text="Dados salvos no MongoDB Atlas")
     await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setausentes(ctx, channel: discord.TextChannel):
-    set_absent_channel(ctx.guild.id, channel.id)
+    await set_absent_channel(ctx.guild.id, channel.id)
     await ctx.send(f"✅ **Canal de ausentes definido para:** {channel.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def removerausentes(ctx):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE server_clans SET absent_channel_id = NULL WHERE guild_id = ?', (ctx.guild.id,))
-    conn.commit()
-    conn.close()
+    await remove_absent_channel(ctx.guild.id)
     await ctx.send("🧹 **O canal de alertas de ausentes foi desativado com sucesso.**")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def painel(ctx):
-    config = get_server_config(ctx.guild.id)
-    if not config or not config['clan_tag']:
+    config = await get_server_config(ctx.guild.id)
+    if not config or not config.get('clan_tag'):
         await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Use `!setcla TAG` primeiro.")
         return
 
@@ -617,22 +525,22 @@ async def painel(ctx):
         await loading_msg.edit(content="❌ Erro ao buscar os dados na Wargaming.")
         return
         
-    embed = build_clan_embed(tag, in_game_members)
+    embed = await build_clan_embed(tag, in_game_members)
     await loading_msg.delete()
     
     panel_msg = await ctx.send(embed=embed)
-    set_server_panel(ctx.guild.id, ctx.channel.id, panel_msg.id)
+    await set_server_panel(ctx.guild.id, ctx.channel.id, panel_msg.id)
     
     current_ids_str = ",".join(str(m['account_id']) for m in in_game_members)
-    update_last_members(ctx.guild.id, current_ids_str)
+    await update_last_members(ctx.guild.id, current_ids_str)
     
     await send_inactivity_warning(ctx.guild, in_game_members)
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def painelonline(ctx):
-    config = get_server_config(ctx.guild.id)
-    if not config or not config['clan_tag']:
+    config = await get_server_config(ctx.guild.id)
+    if not config or not config.get('clan_tag'):
         await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Use `!setcla TAG` primeiro.")
         return
 
@@ -646,114 +554,60 @@ async def painelonline(ctx):
     await loading_msg.delete()
     
     online_msg = await ctx.send(embed=embed)
-    set_online_panel(ctx.guild.id, ctx.channel.id, online_msg.id)
+    await set_online_panel(ctx.guild.id, ctx.channel.id, online_msg.id)
 
 @bot.command()
-async def vincular(ctx):
-    """Comando interativo para vincular nick do WOTB ao Discord."""
-    config = get_server_config(ctx.guild.id)
-    if not config or not config['clan_tag']:
-        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Peça para um Admin usar `!setcla TAG` primeiro.")
+async def vincular(ctx, *, nick_jogo: str = None):
+    """Vincular nick do WOTB ao Discord sem risco de travamento."""
+    config = await get_server_config(ctx.guild.id)
+    if not config or not config.get('clan_tag'):
+        await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
         return
 
-    def check_author(m):
-        return m.author == ctx.author and m.channel == ctx.channel
+    if not nick_jogo:
+        def check_author(m):
+            return m.author == ctx.author and m.channel == ctx.channel
 
-    await ctx.send("🎮 **Qual é o Nick no WOTB do jogador do clã que deseja vincular?**")
-    try:
-        msg_game = await bot.wait_for('message', check=check_author, timeout=60.0)
-    except asyncio.TimeoutError:
-        await ctx.send("⏰ **Tempo esgotado!** Processo de vinculação cancelado.")
-        return
+        await ctx.send("🎮 **Qual é o seu Nick no WOTB?** *(Responda nesta conversa em até 30 segundos)*")
+        try:
+            msg_game = await bot.wait_for('message', check=check_author, timeout=30.0)
+            nick_jogo = msg_game.content.strip()
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ **Tempo esgotado!** Digite `!vincular SEU_NICK` diretamente.")
+            return
 
-    search_nick = msg_game.content.strip().lower()
+    search_nick = nick_jogo.lower()
+    loading_msg = await ctx.send("🔎 Buscando jogador no clã...")
     
-    loading_msg = await ctx.send("🔎 Buscando jogador na lista do clã...")
     tag, clan_members = await fetch_clan_members(config['clan_tag'])
     await loading_msg.delete()
 
     if not clan_members:
-        await ctx.send("❌ Não foi possível carregar os membros do clã no momento.")
+        await ctx.send("❌ Não foi possível carregar os membros do clã.")
         return
 
     matches = [m for m in clan_members if search_nick in m['account_name'].lower()]
 
     if not matches:
-        await ctx.send(f"❌ O jogador **{msg_game.content.strip()}** não foi encontrado dentro do clã **[{tag}]**.")
+        await ctx.send(f"❌ O jogador **{nick_jogo}** não foi encontrado dentro do clã **[{tag}]**.")
         return
 
-    selected_player = None
-    if len(matches) == 1:
-        selected_player = matches[0]
-    else:
-        options_text = "\n".join([f"**{i+1}.** {m['account_name']}" for i, m in enumerate(matches[:5])])
-        await ctx.send(
-            f"🔎 Encontrei mais de um jogador parecido no clã **[{tag}]**:\n{options_text}\n\n"
-            f"👉 Digite o **número** do jogador correspondente (1 a {min(len(matches), 5)}):"
-        )
-        try:
-            msg_choice = await bot.wait_for('message', check=check_author, timeout=30.0)
-            if msg_choice.content.strip().isdigit():
-                idx = int(msg_choice.content.strip()) - 1
-                if 0 <= idx < len(matches[:5]):
-                    selected_player = matches[idx]
-        except asyncio.TimeoutError:
-            await ctx.send("⏰ Tempo esgotado! Seleção cancelada.")
-            return
-
-    if not selected_player:
-        await ctx.send("❌ Seleção inválida. Tente o comando `!vincular` novamente.")
-        return
-
+    selected_player = matches[0]
     acc_id = selected_player['account_id']
     real_game_nick = selected_player['account_name']
 
-    target_member = ctx.author
-    if ctx.author.guild_permissions.administrator:
-        clean_game_nick = real_game_nick.lower()
-        members_map = {m.name.lower(): m for m in ctx.guild.members}
-        members_map.update({m.display_name.lower(): m for m in ctx.guild.members})
-
-        found_match = None
-        if clean_game_nick in members_map:
-            found_match = members_map[clean_game_nick]
-        else:
-            close = difflib.get_close_matches(clean_game_nick, list(members_map.keys()), n=1, cutoff=0.4)
-            if close:
-                found_match = members_map[close[0]]
-
-        if found_match and found_match != ctx.author:
-            await ctx.send(
-                f"🔎 Jogador do clã: **{real_game_nick}**.\n"
-                f"Deseja vincular esta conta ao membro {found_match.mention}? *(Responda 'sim' ou 'nao')*"
-            )
-            try:
-                msg_confirm = await bot.wait_for('message', check=check_author, timeout=30.0)
-                if msg_confirm.content.strip().lower() in ['s', 'sim', 'yes', 'y']:
-                    target_member = found_match
-                else:
-                    await ctx.send("💬 Mencione (`@membro`) ou digite o ID do membro no Discord para vincular:")
-                    msg_target = await bot.wait_for('message', check=check_author, timeout=40.0)
-                    if msg_target.mentions:
-                        target_member = msg_target.mentions[0]
-                    elif msg_target.content.strip().isdigit():
-                        target_member = ctx.guild.get_member(int(msg_target.content.strip()))
-            except asyncio.TimeoutError:
-                await ctx.send("⏰ Tempo esgotado! Processo cancelado.")
-                return
-
-    set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
-    await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
+    await set_mapping(acc_id, real_game_nick, ctx.author.id, str(ctx.author))
+    await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {ctx.author.mention}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def desvincular(ctx, member: discord.Member):
-    remove_mapping(member.id)
-    await ctx.send(f"🗑️ A vinculação do membro {member.mention} foi removida com sucesso.")
+    await remove_mapping(member.id)
+    await ctx.send(f"🗑️ Vinculação do membro {member.mention} removida do MongoDB.")
 
 @bot.command()
 async def vinculados(ctx):
-    mappings = get_all_mappings()
+    mappings = await get_all_mappings()
     if not mappings:
         await ctx.send("ℹ️ Nenhum membro está vinculado no momento.")
         return
@@ -764,14 +618,14 @@ async def vinculados(ctx):
         mentions = " / ".join(f"<@{d['discord_id']}>" for d in d_list)
         lines.append(f"• **{game_nick}** ➔ {mentions}")
         
-    embed = discord.Embed(title="🔗 Membros Vinculados", description="\n".join(lines), color=0x2ECC71)
+    embed = discord.Embed(title="🔗 Membros Vinculados (MongoDB)", description="\n".join(lines), color=0x2ECC71)
     await ctx.send(embed=embed)
 
 @bot.command()
 async def membros(ctx):
-    config = get_server_config(ctx.guild.id)
-    if not config or not config['clan_tag']:
-        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Use `!setcla TAG` primeiro.")
+    config = await get_server_config(ctx.guild.id)
+    if not config or not config.get('clan_tag'):
+        await ctx.send("⚠️ Nenhum clã configurado neste servidor.")
         return
 
     loading_msg = await ctx.send("🔄 Sincronizando dados...")
@@ -780,9 +634,9 @@ async def membros(ctx):
         await loading_msg.edit(content="❌ Erro ao buscar os dados na Wargaming.")
         return
 
-    embed = build_clan_embed(tag, in_game_members)
+    embed = await build_clan_embed(tag, in_game_members)
     await loading_msg.edit(content="", embed=embed)
 
-# Inicializa servidor web Flask e o bot
+# Inicializa o Flask e o Bot
 keep_alive()
 bot.run(DISCORD_TOKEN)
