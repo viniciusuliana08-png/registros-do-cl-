@@ -92,7 +92,7 @@ def update_last_members(guild_id: int, member_ids_str: str):
         UPDATE server_clans 
         SET last_members = ? 
         WHERE guild_id = ?
-    ''', (last_members_str, guild_id))
+    ''', (member_ids_str, guild_id))
     conn.commit()
     conn.close()
 
@@ -157,6 +157,27 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 APPLICATION_ID = os.environ.get("APPLICATION_ID")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
+def get_role_badge(role: str) -> str:
+    """Mapeia todos os identificadores de cargos da Wargaming API."""
+    if not role:
+        return ""
+    
+    r = str(role).lower().strip()
+    
+    # Líder / Comandante
+    if r in ['leader', 'commander', 'clan_commander', 'leader_clan']:
+        return " 👑 [Líder]"
+    
+    # Vice-Líder / Executive Officer / Co-Líder
+    elif r in ['executive_officer', 'vice_leader', 'co_leader', 'deputy_commander', 'sub_commander']:
+        return " ⚔️ [Vice-Líder]"
+        
+    # Outros Oficiais
+    elif r in ['commander_assistant', 'recruiter', 'diplomat', 'quartermaster', 'personnel_officer', 'combat_officer']:
+        return " 📜 [Oficial]"
+        
+    return ""
+
 async def fetch_clan_members(target_tag: str):
     """Busca membros do clã, cargos e datas de batalha na Wargaming API."""
     regions = [
@@ -220,7 +241,7 @@ async def fetch_clan_members(target_tag: str):
                     member_list = []
                     for m_id, m_info in members.items():
                         last_battle_ts = last_battle_dict.get(str(m_id), 0)
-                        role = m_info.get('role', 'private')
+                        role = m_info.get('role', '')
                         
                         is_inactive_30d = False
                         if last_battle_ts > 0:
@@ -247,17 +268,6 @@ async def fetch_clan_members(target_tag: str):
             print(f"Erro ao carregar membros do clã: {e}")
             
     return None, []
-
-def get_role_badge(role: str) -> str:
-    """Retorna ícone do cargo do jogador no jogo."""
-    role_lower = role.lower()
-    if role_lower in ['leader', 'commander']:
-        return " 👑 [Líder]"
-    elif role_lower in ['vice_leader', 'executive_officer', 'co_leader', 'deputy_commander']:
-        return " ⚔️ [Vice-Líder]"
-    elif role_lower in ['commander_assistant', 'recruiter']:
-        return " 📜 [Oficial]"
-    return ""
 
 def build_clan_embed(tag, in_game_members):
     """Constrói o embed com formatação avançada (Cargos + Inativos + Mapeamento)."""
@@ -296,7 +306,9 @@ def build_clan_embed(tag, in_game_members):
     def add_safe_fields(embed_obj, title, item_list):
         if not item_list:
             embed_obj.add_field(name=title, value="Nenhum membro.", inline=False)
-            return current_text = ""
+            return
+            
+        current_text = ""
         part = 1
         for item in item_list:
             if len(current_text) + len(item) + 1 > 950:
@@ -365,7 +377,6 @@ async def auto_update_job():
         if not in_game_members:
             continue
             
-        # Entradas e Saídas
         current_ids = {m['account_id']: m['account_name'] for m in in_game_members}
         last_ids_str = config.get('last_members')
         channel = bot.get_channel(config['channel_id']) if config.get('channel_id') else None
@@ -382,7 +393,6 @@ async def auto_update_job():
         current_ids_str = ",".join(map(str, current_ids.keys()))
         update_last_members(g_id, current_ids_str)
         
-        # Atualiza Painel Principal
         if config.get('channel_id') and config.get('panel_message_id') and channel:
             try:
                 panel_msg = await channel.fetch_message(config['panel_message_id'])
