@@ -457,7 +457,6 @@ async def auto_update_job():
 
         channel = bot.get_channel(config['channel_id']) if config.get('channel_id') else None
 
-        # --- IDEIA 4: DETECÇÃO DE MUDANÇA DE NICK ---
         for m in in_game_members:
             acc_id = m['account_id']
             current_nick = m['account_name']
@@ -465,10 +464,7 @@ async def auto_update_job():
             if acc_id in mappings:
                 old_nick = mappings[acc_id][0]['acc_name']
                 if old_nick != current_nick:
-                    # Atualiza o novo nick no banco de dados
                     update_account_nickname_by_id(acc_id, current_nick)
-                    
-                    # Notifica no canal do clã
                     if channel:
                         discord_mentions = " / ".join(f"<@{d['discord_id']}>" for d in mappings[acc_id])
                         await channel.send(
@@ -476,10 +472,8 @@ async def auto_update_job():
                             f"alterou o seu nick de `{old_nick}` para **`{current_nick}`**!"
                         )
 
-        # Recarrega os vínculos atualizados
         mappings = get_all_mappings()
 
-        # Registro de Entradas e Saídas do Clã
         current_ids = {m['account_id']: m['account_name'] for m in in_game_members}
         last_ids_str = config.get('last_members')
         
@@ -495,7 +489,6 @@ async def auto_update_job():
         current_ids_str = ",".join(map(str, current_ids.keys()))
         update_last_members(g_id, current_ids_str)
         
-        # Atualiza a mensagem do painel principal
         if config.get('channel_id') and config.get('panel_message_id') and channel:
             try:
                 panel_msg = await channel.fetch_message(config['panel_message_id'])
@@ -583,7 +576,7 @@ async def ajuda(ctx):
     )
     embed.add_field(
         name="🔗 Vincular Contas (`!vincular` / `!desvincular`)",
-        value="O `!vincular` busca o Nick no jogo em todas as regiões da Wargaming e associa ao usuário do Discord. Se for utilizado por um Administrador, ele solicitará a confirmação ou menção do membro.",
+        value="O `!vincular` busca o Nick exclusivamente dentro da lista do seu clã e associa ao membro no Discord.",
         inline=False
     )
     embed.add_field(
@@ -657,51 +650,68 @@ async def painelonline(ctx):
 
 @bot.command()
 async def vincular(ctx):
+    """Comando interativo para vincular nick do WOTB (restrito aos membros do clã) ao Discord."""
+    config = get_server_config(ctx.guild.id)
+    if not config or not config['clan_tag']:
+        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Peça para um Admin usar `!setcla TAG` primeiro.")
+        return
+
     def check_author(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
-    await ctx.send("🎮 **Qual é o seu Nick exato (ou o nick do jogador) no WOTB?**")
+    await ctx.send("🎮 **Qual é o Nick no WOTB do jogador do clã que deseja vincular?**")
     try:
         msg_game = await bot.wait_for('message', check=check_author, timeout=60.0)
     except asyncio.TimeoutError:
         await ctx.send("⏰ **Tempo esgotado!** Processo de vinculação cancelado.")
         return
 
-    game_nick = msg_game.content.strip()
+    search_nick = msg_game.content.strip().lower()
     
-    async with aiohttp.ClientSession() as session:
-        regions = [
-            "https://api.wotblitz.com",
-            "https://api.wotblitz.eu",
-            "https://api.wotblitz.asia"
-        ]
-        acc_id = None
-        real_game_nick = game_nick
-        
-        for reg in regions:
-            url = f"{reg}/wotb/account/list/?application_id={APPLICATION_ID}&search={game_nick}&type=startswith"
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        players = data.get('data', [])
-                        if players:
-                            for p in players:
-                                if p['nickname'].lower() == game_nick.lower():
-                                    acc_id = p['account_id']
-                                    real_game_nick = p['nickname']
-                                    break
-                            if not acc_id:
-                                acc_id = players[0]['account_id']
-                                real_game_nick = players[0]['nickname']
-                            break
-            except Exception:
-                pass
+    # Carrega os membros ATUAIS do clã
+    loading_msg = await ctx.send("🔎 Buscando jogador na lista do clã...")
+    tag, clan_members = await fetch_clan_members(config['clan_tag'])
+    await loading_msg.delete()
 
-    if not acc_id:
-        await ctx.send(f"❌ Não foi possível encontrar nenhum jogador com o nick **{game_nick}** na Wargaming.")
+    if not clan_members:
+        await ctx.send("❌ Não foi possível carregar os membros do clã no momento.")
         return
 
+    # Busca correspondências dentro da lista do clã
+    matches = [m for m in clan_members if search_nick in m['account_name'].lower()]
+
+    if not matches:
+        await ctx.send(f"❌ O jogador **{msg_game.content.strip()}** não foi encontrado dentro do clã **[{tag}]**.")
+        return
+
+    selected_player = None
+    if len(matches) == 1:
+        selected_player = matches[0]
+    else:
+        # Se mais de um membro corresponder ao nome digitado
+        options_text = "\n".join([f"**{i+1}.** {m['account_name']}" for i, m in enumerate(matches[:5])])
+        await ctx.send(
+            f"🔎 Encontrei mais de um jogador parecido no clã **[{tag}]**:\n{options_text}\n\n"
+            f"👉 Digite o **número** do jogador correspondente (1 a {min(len(matches), 5)}):"
+        )
+        try:
+            msg_choice = await bot.wait_for('message', check=check_author, timeout=30.0)
+            if msg_choice.content.strip().isdigit():
+                idx = int(msg_choice.content.strip()) - 1
+                if 0 <= idx < len(matches[:5]):
+                    selected_player = matches[idx]
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Tempo esgotado! Seleção cancelada.")
+            return
+
+    if not selected_player:
+        await ctx.send("❌ Seleção inválida. Tente o comando `!vincular` novamente.")
+        return
+
+    acc_id = selected_player['account_id']
+    real_game_nick = selected_player['account_name']
+
+    # Se quem usou for administrador, ele pode escolher qual conta do Discord associar
     target_member = ctx.author
     if ctx.author.guild_permissions.administrator:
         clean_game_nick = real_game_nick.lower()
@@ -712,13 +722,13 @@ async def vincular(ctx):
         if clean_game_nick in members_map:
             found_match = members_map[clean_game_nick]
         else:
-            matches = difflib.get_close_matches(clean_game_nick, list(members_map.keys()), n=1, cutoff=0.4)
-            if matches:
-                found_match = members_map[matches[0]]
+            close = difflib.get_close_matches(clean_game_nick, list(members_map.keys()), n=1, cutoff=0.4)
+            if close:
+                found_match = members_map[close[0]]
 
         if found_match and found_match != ctx.author:
             await ctx.send(
-                f"🔎 Encontrei o jogador **{real_game_nick}**.\n"
+                f"🔎 Jogador do clã: **{real_game_nick}**.\n"
                 f"Deseja vincular esta conta ao membro {found_match.mention}? *(Responda 'sim' ou 'nao')*"
             )
             try:
@@ -733,7 +743,7 @@ async def vincular(ctx):
                     elif msg_target.content.strip().isdigit():
                         target_member = ctx.guild.get_member(int(msg_target.content.strip()))
             except asyncio.TimeoutError:
-                await ctx.send("⏰ **Tempo esgotado!** Processo cancelado.")
+                await ctx.send("⏰ Tempo esgotado! Processo cancelado.")
                 return
 
     set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
