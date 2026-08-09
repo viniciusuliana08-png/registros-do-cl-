@@ -29,19 +29,15 @@ def get_server_config(guild_id):
     try:
         doc = servers_col.find_one({"guild_id": str(guild_id)})
         if doc:
-            return {
-                "clan_tag": doc.get("clan_tag"), 
-                "clan_id": doc.get("clan_id"),
-                "region": doc.get("region", "na")
-            }
+            return {"clan_tag": doc.get("clan_tag"), "clan_id": doc.get("clan_id")}
     except Exception as e:
         print(f"Erro ao buscar config do servidor: {e}")
-    return {"clan_tag": None, "clan_id": None, "region": "na"}
+    return {"clan_tag": None, "clan_id": None}
 
-def set_server_config(guild_id, clan_tag, clan_id, region="na"):
+def set_server_config(guild_id, clan_tag, clan_id):
     servers_col.update_one(
         {"guild_id": str(guild_id)},
-        {"$set": {"clan_tag": clan_tag, "clan_id": clan_id, "region": region}},
+        {"$set": {"clan_tag": clan_tag, "clan_id": clan_id}},
         upsert=True
     )
 
@@ -92,23 +88,17 @@ async def start_web_server():
     await site.start()
     print(f"🌐 Servidor HTTP rodando na porta {port} (Render OK)")
 
-# --- Funções da API Wargaming Multirregião ---
+# --- Funções da API Wargaming ---
 
-REGIONS = {
-    "na": "https://api.wotblitz.com/wotb/",
-    "eu": "https://api.wotblitz.eu/wotb/",
-    "asia": "https://api.wotblitz.asia/wotb/"
-}
-
-async def fetch_clan_id_by_tag(tag, region="na"):
-    clean_tag = tag.strip().replace("[", "").replace("]", "").replace("–", "-").replace("—", "-")
+async def fetch_clan_id_by_tag(tag):
+    # Normaliza qualquer tipo de hífen/traço
+    clean_tag = str(tag).strip().replace("[", "").replace("]", "").replace("–", "-").replace("—", "-")
     app_id = WARGAMING_APP_ID or "demo"
-    base_url = REGIONS.get(region.lower(), REGIONS["na"])
-    url = f"{base_url}clans/list/"
+    url = "https://api.wotblitz.com/wotb/clans/list/"
     
     params = {
         "application_id": str(app_id),
-        "search": str(clean_tag)
+        "search": clean_tag
     }
     
     async with aiohttp.ClientSession() as session:
@@ -116,31 +106,32 @@ async def fetch_clan_id_by_tag(tag, region="na"):
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == "ok" and data.get("data"):
+                    # Tenta encontrar a correspondência exata ignorando maiúsculas/minúsculas e hífens
+                    target_normalized = clean_tag.lower().replace("-", "")
                     for clan in data["data"]:
                         clan_tag_api = clan.get("tag", "").strip()
-                        if clan_tag_api.lower() == clean_tag.lower():
+                        if clan_tag_api.lower().replace("-", "") == target_normalized:
                             return clan.get("clan_id"), clan_tag_api
                     
+                    # Se não achou exato, pega o primeiro retornado pela API
                     first_clan = data["data"][0]
                     return first_clan.get("clan_id"), first_clan.get("tag")
             return None, None
 
-async def fetch_clan_members(tag_or_id, region="na"):
+async def fetch_clan_members(tag_or_id):
     clan_id = None
     clan_tag = None
 
     if str(tag_or_id).isdigit():
         clan_id = int(tag_or_id)
     else:
-        clan_id, clan_tag = await fetch_clan_id_by_tag(str(tag_or_id), region)
+        clan_id, clan_tag = await fetch_clan_id_by_tag(str(tag_or_id))
 
     if not clan_id:
         return None, []
 
     app_id = WARGAMING_APP_ID or "demo"
-    base_url = REGIONS.get(region.lower(), REGIONS["na"])
-    url = f"{base_url}clans/info/"
-    
+    url = "https://api.wotblitz.com/wotb/clans/info/"
     params = {
         "application_id": str(app_id),
         "clan_id": str(clan_id),
@@ -182,19 +173,22 @@ async def on_ready():
 
 @bot.command(name="setcla")
 @commands.has_permissions(administrator=True)
-async def setcla(ctx, tag: str = None, region: str = "na"):
-    """Configura a TAG do Clã e a Região (ex: !setcla MR-S na ou !setcla MR-S eu)."""
-    region = region.lower()
-    if region not in REGIONS:
-        await ctx.send("⚠️ Região inválida! Use `na` (América do Norte), `eu` (Europa) ou `asia` (Ásia).")
-        return
+async def setcla(ctx, *, tag: str = None):
+    """Configura a TAG do Clã do servidor."""
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
 
     if not tag:
-        await ctx.send("⚙️ **Qual a TAG do clã?** Exemplo: `!setcla MR-S na` ou `!setcla MR-S eu`")
-        return
+        await ctx.send("⚙️ **Qual a TAG do clã que deseja configurar para este servidor?** (ex: `MR-S`)")
+        try:
+            msg = await bot.wait_for('message', check=check, timeout=30.0)
+            tag = msg.content.strip()
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Tempo esgotado! Configuração cancelada.")
+            return
 
-    loading = await ctx.send(f"🔎 Validando clã `[{tag}]` no servidor **{region.upper()}** na Wargaming...")
-    clan_id, real_tag = await fetch_clan_id_by_tag(tag, region)
+    loading = await ctx.send(f"🔎 Validando clã `[{tag}]` na Wargaming...")
+    clan_id, real_tag = await fetch_clan_id_by_tag(tag)
     
     try:
         await loading.delete()
@@ -202,22 +196,18 @@ async def setcla(ctx, tag: str = None, region: str = "na"):
         pass
 
     if not clan_id:
-        await ctx.send(
-            f"❌ Não foi possível encontrar o clã **[{tag}]** na região **{region.upper()}**.\n"
-            f"👉 Se o seu clã for da Europa, tente: `!setcla {tag} eu`\n"
-            f"👉 Certifique-se de cadastrar uma API Key válida da Wargaming na variável `WARGAMING_APP_ID` do Render."
-        )
+        await ctx.send(f"❌ Não foi possível encontrar o clã com a TAG `[{tag}]` na Wargaming. Verifique se o nome está correto.")
         return
 
-    set_server_config(ctx.guild.id, real_tag, clan_id, region)
-    await ctx.send(f"✅ Clã **[{real_tag}]** (ID: `{clan_id}`, Região: `{region.upper()}`) configurado com sucesso!")
+    set_server_config(ctx.guild.id, real_tag, clan_id)
+    await ctx.send(f"✅ Clã **[{real_tag}]** (ID: `{clan_id}`) configurado com sucesso e salvo na nuvem!")
 
 @bot.command(name="vincular")
 async def vincular(ctx, *, nick_direto: str = None):
     """Vincular jogador do WOTB ao Discord."""
     config = get_server_config(ctx.guild.id)
     if not config or not config.get('clan_tag'):
-        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Um Admin precisa usar `!setcla TAG [regiao]` primeiro.")
+        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Um Admin precisa usar `!setcla TAG` primeiro.")
         return
 
     def check_author(m):
@@ -235,7 +225,7 @@ async def vincular(ctx, *, nick_direto: str = None):
         search_nick = nick_direto.strip().lower()
 
     loading_msg = await ctx.send("🔎 Buscando jogador no clã...")
-    tag, clan_members = await fetch_clan_members(config['clan_tag'], config.get('region', 'na'))
+    tag, clan_members = await fetch_clan_members(config['clan_tag'])
 
     try:
         await loading_msg.delete()
@@ -365,7 +355,7 @@ async def ajuda(ctx):
     )
     embed.add_field(name="`!vincular [NICK]`", value="Vincula sua conta do jogo ao perfil do Discord.", inline=False)
     embed.add_field(name="`!vinculados`", value="Lista todos os membros salvos.", inline=False)
-    embed.add_field(name="`!setcla [TAG] [regiao]`", value="(Admin) Configura o clã (ex: `!setcla MR-S eu` ou `!setcla MR-S na`).", inline=False)
+    embed.add_field(name="`!setcla [TAG]`", value="(Admin) Configura o clã ativo do servidor.", inline=False)
     embed.add_field(name="`!desvincular [@membro/Nick]`", value="(Admin) Remove um vínculo.", inline=False)
     await ctx.send(embed=embed)
 
