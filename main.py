@@ -472,7 +472,7 @@ async def on_command_error(ctx, error):
 
 # --- 7. COMANDOS ---
 
-@bot.command(name="ajuda", aliases=["help"])
+@bot.command(name="ajuda")
 async def ajuda(ctx):
     embed = discord.Embed(
         title="📖 Ajuda / Comandos do Bot",
