@@ -91,17 +91,6 @@ async def get_all_configured_servers():
     servers = await cursor.to_list(length=None)
     return [s["guild_id"] for s in servers]
 
-async def set_mapping(account_id: int, account_name: str, discord_id: int, discord_name: str):
-    await mappings_col.update_one(
-        {"discord_id": discord_id},
-        {"$set": {
-            "account_id": account_id,
-            "account_name": account_name,
-            "discord_name": discord_name
-        }},
-        upsert=True
-    )
-
 async def update_account_nickname_by_id(account_id: int, new_account_name: str):
     await mappings_col.update_many(
         {"account_id": account_id},
@@ -109,7 +98,7 @@ async def update_account_nickname_by_id(account_id: int, new_account_name: str):
     )
 
 async def remove_mapping(discord_id: int):
-    await mappings_col.delete_one({"discord_id": discord_id})
+    await mappings_col.delete_many({"discord_id": discord_id})
 
 async def get_all_mappings():
     cursor = mappings_col.find({})
@@ -120,11 +109,12 @@ async def get_all_mappings():
         acc_id = doc["account_id"]
         if acc_id not in mappings:
             mappings[acc_id] = []
-        mappings[acc_id].append({
-            'acc_name': doc["account_name"],
-            'discord_id': doc["discord_id"],
-            'discord_name': doc.get("discord_name", "")
-        })
+        if not any(d['discord_id'] == doc["discord_id"] for d in mappings[acc_id]):
+            mappings[acc_id].append({
+                'acc_name': doc["account_name"],
+                'discord_id': doc["discord_id"],
+                'discord_name': doc.get("discord_name", "")
+            })
     return mappings
 
 # --- 4. CONFIGURAÇÃO DO BOT ---
@@ -482,6 +472,29 @@ async def on_command_error(ctx, error):
 
 # --- 7. COMANDOS ---
 
+@bot.command(name="ajuda", aliases=["help"])
+async def ajuda(ctx):
+    embed = discord.Embed(
+        title="📖 Ajuda / Comandos do Bot",
+        description="**Manual Resumido:**",
+        color=0x2ECC71
+    )
+    embed.add_field(
+        name="🛠️ Comandos Principais",
+        value=(
+            "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord de forma rápida e inteligente.\n"
+            "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
+            "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
+            "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
+            "• `!vinculados` ➔ Lista todas as contas vinculadas.\n"
+            "• `!pendentes` ➔ Lista quem falta se vincular.\n"
+            "• `!desvincular @membro` ➔ Remove vinculação."
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Dados salvos no MongoDB Atlas")
+    await ctx.send(embed=embed)
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setcla(ctx, tag: str):
@@ -568,7 +581,7 @@ async def painelonline(ctx):
 
 @bot.command()
 async def vincular(ctx, *, nick_jogo: str = None):
-    """Vincula o nick do WOTB em 1 passo, buscando similaridades no jogo e validando o Discord."""
+    """Vincula o nick do WOTB, permitindo até 2 contas por usuário do Discord e vice-versa."""
     if not nick_jogo:
         await ctx.send("⚠️ **Uso incorreto!** Digite o seu nick do jogo junto com o comando.\nExemplo: `!vincular 2pende`")
         return
@@ -592,7 +605,6 @@ async def vincular(ctx, *, nick_jogo: str = None):
     search_nick = nick_jogo.lower()
     matches = [m for m in clan_members if search_nick == m['account_name'].lower()]
 
-    # Se não achou exato, usa Fuzzy Matching para corrigir erros de digitação no nick
     if not matches:
         clan_nicks = [m['account_name'] for m in clan_members]
         close_matches = difflib.get_close_matches(nick_jogo, clan_nicks, n=1, cutoff=0.5)
@@ -610,13 +622,11 @@ async def vincular(ctx, *, nick_jogo: str = None):
     acc_id = selected_player['account_id']
     real_game_nick = selected_player['account_name']
 
-    # 1. Procura automaticamente se há alguém com nick/apelido parecido no Discord
     target_member = discord.utils.find(
         lambda m: real_game_nick.lower() in m.name.lower() or (m.nick and real_game_nick.lower() in m.nick.lower()),
         ctx.guild.members
     )
 
-    # 2. Se encontrou um perfil parecido no Discord, pergunta para confirmar
     if target_member:
         await ctx.send(
             f"🎯 Encontrado no jogo: **{real_game_nick}**!\n"
@@ -627,12 +637,11 @@ async def vincular(ctx, *, nick_jogo: str = None):
             resposta = msg_confirm.content.strip().lower()
 
             if resposta not in ['sim', 's', 'yes', 'y']:
-                target_member = None  # Se disser não, limpa para pedir a menção manual
+                target_member = None
         except asyncio.TimeoutError:
             await ctx.send("⏰ **Tempo esgotado!** Vinculação cancelada.")
             return
 
-    # 3. Se não achou automaticamente ou se respondeu "não", pede a menção manual
     if not target_member:
         await ctx.send("💬 Por favor, mencione o membro correto do Discord (ex: `@username` ou digite `eu` se for você):")
         try:
@@ -657,8 +666,31 @@ async def vincular(ctx, *, nick_jogo: str = None):
             await ctx.send("⏰ **Tempo esgotado!** Vinculação cancelada.")
             return
 
-    # 4. Salva no banco de dados
-    await set_mapping(acc_id, real_game_nick, target_member.id, str(target_member))
+    # Verificação dos limites (máximo de 2 contas em ambas as direções)
+    existing_discord_links = await mappings_col.find({"discord_id": target_member.id}).to_list(length=None)
+    is_already_linked = any(doc["account_id"] == acc_id for doc in existing_discord_links)
+
+    if not is_already_linked and len(existing_discord_links) >= 2:
+        await ctx.send(f"⚠️ **Limite atingido!** O usuário {target_member.mention} já possui o máximo de **2 contas de jogo** vinculadas.")
+        return
+
+    existing_account_links = await mappings_col.find({"account_id": acc_id}).to_list(length=None)
+    is_account_already_linked = any(doc["discord_id"] == target_member.id for doc in existing_account_links)
+
+    if not is_account_already_linked and len(existing_account_links) >= 2:
+        await ctx.send(f"⚠️ **Limite atingido!** A conta de jogo **{real_game_nick}** já possui o máximo de **2 contas do Discord** vinculadas.")
+        return
+
+    # Salva no banco de dados
+    await mappings_col.update_one(
+        {"discord_id": target_member.id, "account_id": acc_id},
+        {"$set": {
+            "account_id": acc_id,
+            "account_name": real_game_nick,
+            "discord_name": str(target_member)
+        }},
+        upsert=True
+    )
     await ctx.send(f"🎉 **Vinculação realizada com sucesso!**\n🎮 **Jogo:** `{real_game_nick}` ➔ 💬 **Discord:** {target_member.mention}")
 
 @bot.command(name="pendentes", aliases=["naovinculados"])
@@ -714,7 +746,7 @@ async def pendentes(ctx):
 @commands.has_permissions(administrator=True)
 async def desvincular(ctx, member: discord.Member):
     await remove_mapping(member.id)
-    await ctx.send(f"🗑️ Vinculação do membro {member.mention} removida do MongoDB.")
+    await ctx.send(f"🗑️ Vinculações do membro {member.mention} removidas do MongoDB.")
 
 @bot.command()
 async def vinculados(ctx):
