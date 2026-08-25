@@ -499,7 +499,7 @@ async def ajuda(ctx):
         name="🛠️ Comandos Principais",
         value=(
             "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord de forma rápida e inteligente.\n"
-            "• `!atual` ➔ Atualiza manualmente todas as tabelas e dados do clã.\n"
+            "• `!atual` ➔ Atualiza manualmente todas as tabelas, dados e painéis do clã.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
@@ -527,7 +527,7 @@ async def setcla(ctx, tag: str):
         name="🛠️ Comandos Principais",
         value=(
             "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord de forma rápida e inteligente.\n"
-            "• `!atual` ➔ Atualiza manualmente todas as tabelas e dados do clã.\n"
+            "• `!atual` ➔ Atualiza manualmente todas as tabelas, dados e painéis do clã.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
@@ -543,7 +543,7 @@ async def setcla(ctx, tag: str):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def atual(ctx):
-    """Atualiza manualmente todas as tabelas, dados do clã e os painéis ativos no servidor."""
+    """Atualiza manualmente todas as tabelas, dados do clã, envia avisos de alterações e atualiza os painéis."""
     config = await get_server_config(ctx.guild.id)
     if not config or not config.get('clan_tag'):
         await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Use `!setcla TAG` primeiro.")
@@ -559,7 +559,7 @@ async def atual(ctx):
 
     mappings = await get_all_mappings()
 
-    # Atualiza nicks caso tenham mudado
+    # Atualiza nicks caso tenham mudado e avisa no chat
     for m in in_game_members:
         acc_id = m['account_id']
         current_nick = m['account_name']
@@ -568,9 +568,37 @@ async def atual(ctx):
             old_nick = mappings[acc_id][0]['acc_name']
             if old_nick != current_nick:
                 await update_account_nickname_by_id(acc_id, current_nick)
+                await ctx.send(
+                    f"✏️ **TROCA DE NICK DETECTADA:** O membro alterou o seu nick de `{old_nick}` para **`{current_nick}`**!"
+                )
 
-    # Atualiza o mapa de últimos membros registrados
+    # Verifica saídas e entradas comparando com os dados salvos anteriormente e avisa no chat
     current_members_map = {str(m['account_id']): m['account_name'] for m in in_game_members}
+    last_members_data = config.get('last_members')
+    
+    if isinstance(last_members_data, str):
+        old_ids = set(map(int, last_members_data.split(','))) if last_members_data else set()
+        last_members_map = {str(i): f"ID {i}" for i in old_ids}
+    elif isinstance(last_members_data, dict):
+        last_members_map = last_members_data
+    else:
+        last_members_map = {}
+    
+    if last_members_map:
+        old_ids = set(map(int, last_members_map.keys()))
+        new_ids = set(int(k) for k in current_members_map.keys())
+        
+        for e_id in (new_ids - old_ids):
+            e_str = str(e_id)
+            new_name = current_members_map.get(e_str, "Jogador")
+            await ctx.send(f"🎉 **NOVO MEMBRO:** O jogador **{new_name}** entrou no clã **[{tag}]**!")
+            
+        for s_id in (old_ids - new_ids):
+            s_str = str(s_id)
+            old_name = last_members_map.get(s_str, f"ID {s_id}")
+            await ctx.send(f"🚪 **SAÍDA:** O jogador **{old_name}** deixou o clã **[{tag}]**.")
+
+    # Atualiza o registro dos membros atuais no banco
     await update_last_members(ctx.guild.id, current_members_map)
 
     # Atualiza o painel principal se configurado
@@ -593,7 +621,7 @@ async def atual(ctx):
         except Exception as e:
             print(f"Erro ao atualizar painel online no !atual: {e}")
 
-    await loading_msg.edit(content="✅ **Todas as tabelas e dados foram atualizados com sucesso!**")
+    await loading_msg.edit(content="✅ **Todas as tabelas, dados e painéis foram atualizados com sucesso!**")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
