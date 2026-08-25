@@ -307,23 +307,27 @@ def build_online_embed(tag, in_game_members):
         if m['raw_ts'] > 0:
             dt_battle = datetime.fromtimestamp(m['raw_ts'], tz=TIMEZONE_BR)
             diff = now - dt_battle
-            if diff <= timedelta(minutes=15):
-                mins = int(diff.total_seconds() / 60)
-                time_str = f"há {mins} min" if mins > 0 else "agora mesmo"
+            if diff <= timedelta(hours=1):
+                hours = int(diff.total_seconds() / 3600)
+                mins = int((diff.total_seconds() % 3600) / 60)
+                if hours > 0:
+                    time_str = f"há {hours}h {mins}min" if mins > 0 else f"há {hours}h"
+                else:
+                    time_str = f"há {mins} min" if mins > 0 else "agora mesmo"
                 role_badge = m['role_badge']
                 ts_disc = format_ts_discord(m['raw_ts'])
                 recent_activity.append(f"🎮 **{m['account_name']}**{role_badge} ▫️ *{time_str}* ({ts_disc})")
 
     embed = discord.Embed(
         title=f"⚡ Atividade Recente / Online [{tag}]",
-        description="Jogadores que entraram em batalha nos **últimos 15 minutos**:\n───────────────────────────────",
+        description="Jogadores que entraram em batalha na **última 1 hora**:\n───────────────────────────────",
         color=0x2ECC71
     )
     
     if recent_activity:
         embed.add_field(name="🟢 Ativos Recentemente", value="\n".join(recent_activity), inline=False)
     else:
-        embed.add_field(name="💤 Status do Clã", value="Nenhum membro esteve em batalha nos últimos 15 minutos.", inline=False)
+        embed.add_field(name="💤 Status do Clã", value="Nenhum membro esteve em batalha na última 1 hora.", inline=False)
         
     embed.set_footer(text="Atualizado a cada 5 minutos • Horário de Brasília")
     embed.timestamp = now_br()
@@ -399,7 +403,6 @@ async def auto_update_job():
         current_members_map = {str(m['account_id']): m['account_name'] for m in in_game_members}
         last_members_data = config.get('last_members')
         
-        # Compatibilidade com dados antigos salvos como string no banco
         if isinstance(last_members_data, str):
             old_ids = set(map(int, last_members_data.split(','))) if last_members_data else set()
             last_members_map = {str(i): f"ID {i}" for i in old_ids}
@@ -496,6 +499,7 @@ async def ajuda(ctx):
         name="🛠️ Comandos Principais",
         value=(
             "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord de forma rápida e inteligente.\n"
+            "• `!atual` ➔ Atualiza manualmente todas as tabelas e dados do clã.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
@@ -523,6 +527,7 @@ async def setcla(ctx, tag: str):
         name="🛠️ Comandos Principais",
         value=(
             "• `!vincular NICK_DO_JOGO` ➔ Vincula sua conta ao Discord de forma rápida e inteligente.\n"
+            "• `!atual` ➔ Atualiza manualmente todas as tabelas e dados do clã.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
             "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
@@ -534,6 +539,61 @@ async def setcla(ctx, tag: str):
     )
     embed.set_footer(text="Dados salvos no MongoDB Atlas")
     await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def atual(ctx):
+    """Atualiza manualmente todas as tabelas, dados do clã e os painéis ativos no servidor."""
+    config = await get_server_config(ctx.guild.id)
+    if not config or not config.get('clan_tag'):
+        await ctx.send("⚠️ Nenhum clã foi configurado neste servidor. Use `!setcla TAG` primeiro.")
+        return
+
+    loading_msg = await ctx.send(f"🔄 Atualizando todas as tabelas e dados do clã **[{config['clan_tag']}]**...")
+    
+    clan_tag = config['clan_tag']
+    tag, in_game_members = await fetch_clan_members(clan_tag)
+    if not in_game_members:
+        await loading_msg.edit(content="❌ Erro ao buscar os dados na Wargaming.")
+        return
+
+    mappings = await get_all_mappings()
+
+    # Atualiza nicks caso tenham mudado
+    for m in in_game_members:
+        acc_id = m['account_id']
+        current_nick = m['account_name']
+        
+        if acc_id in mappings:
+            old_nick = mappings[acc_id][0]['acc_name']
+            if old_nick != current_nick:
+                await update_account_nickname_by_id(acc_id, current_nick)
+
+    # Atualiza o mapa de últimos membros registrados
+    current_members_map = {str(m['account_id']): m['account_name'] for m in in_game_members}
+    await update_last_members(ctx.guild.id, current_members_map)
+
+    # Atualiza o painel principal se configurado
+    if config.get('channel_id') and config.get('panel_message_id'):
+        try:
+            panel_channel = bot.get_channel(config['channel_id']) or ctx.channel
+            panel_msg = await panel_channel.fetch_message(config['panel_message_id'])
+            embed = await build_clan_embed(tag, in_game_members)
+            await panel_msg.edit(embed=embed)
+        except Exception as e:
+            print(f"Erro ao atualizar painel principal no !atual: {e}")
+
+    # Atualiza o painel online se configurado
+    if config.get('channel_id') and config.get('online_panel_message_id'):
+        try:
+            online_channel = bot.get_channel(config['channel_id']) or ctx.channel
+            online_msg = await online_channel.fetch_message(config['online_panel_message_id'])
+            embed_online = build_online_embed(tag, in_game_members)
+            await online_msg.edit(embed=embed_online)
+        except Exception as e:
+            print(f"Erro ao atualizar painel online no !atual: {e}")
+
+    await loading_msg.edit(content="✅ **Todas as tabelas e dados foram atualizados com sucesso!**")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -679,7 +739,6 @@ async def vincular(ctx, *, nick_jogo: str = None):
             await ctx.send("⏰ **Tempo esgotado!** Vinculação cancelada.")
             return
 
-    # Verificação dos limites (máximo de 2 contas em ambas as direções)
     existing_discord_links = await mappings_col.find({"discord_id": target_member.id}).to_list(length=None)
     is_already_linked = any(doc["account_id"] == acc_id for doc in existing_discord_links)
 
@@ -694,7 +753,6 @@ async def vincular(ctx, *, nick_jogo: str = None):
         await ctx.send(f"⚠️ **Limite atingido!** A conta de jogo **{real_game_nick}** já possui o máximo de **2 contas do Discord** vinculadas.")
         return
 
-    # Salva no banco de dados
     await mappings_col.update_one(
         {"discord_id": target_member.id, "account_id": acc_id},
         {"$set": {
@@ -708,7 +766,6 @@ async def vincular(ctx, *, nick_jogo: str = None):
 
 @bot.command(name="pendentes", aliases=["naovinculados"])
 async def pendentes(ctx):
-    """Exibe a lista de membros do clã no jogo que ainda NÃO se vincularam ao Discord."""
     config = await get_server_config(ctx.guild.id)
     if not config or not config.get('clan_tag'):
         await ctx.send("⚠️ Nenhum clã configurado neste servidor. Use `!setcla TAG` primeiro.")
