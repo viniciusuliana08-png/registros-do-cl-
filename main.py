@@ -76,10 +76,10 @@ async def set_online_panel(guild_id: int, channel_id: int, message_id: int):
         upsert=True
     )
 
-async def update_last_members(guild_id: int, member_ids_str: str):
+async def update_last_members(guild_id: int, members_map: dict):
     await servers_col.update_one(
         {"guild_id": guild_id},
-        {"$set": {"last_members": member_ids_str}},
+        {"$set": {"last_members": members_map}},
         upsert=True
     )
 
@@ -396,20 +396,33 @@ async def auto_update_job():
                             f"alterou o seu nick de `{old_nick}` para **`{current_nick}`**!"
                         )
 
-        current_ids = {m['account_id']: m['account_name'] for m in in_game_members}
-        last_ids_str = config.get('last_members')
+        current_members_map = {str(m['account_id']): m['account_name'] for m in in_game_members}
+        last_members_data = config.get('last_members')
         
-        if last_ids_str and channel:
-            old_ids = set(map(int, last_ids_str.split(','))) if last_ids_str else set()
-            new_ids = set(current_ids.keys())
+        # Compatibilidade com dados antigos salvos como string no banco
+        if isinstance(last_members_data, str):
+            old_ids = set(map(int, last_members_data.split(','))) if last_members_data else set()
+            last_members_map = {str(i): f"ID {i}" for i in old_ids}
+        elif isinstance(last_members_data, dict):
+            last_members_map = last_members_data
+        else:
+            last_members_map = {}
+        
+        if last_members_map and channel:
+            old_ids = set(map(int, last_members_map.keys()))
+            new_ids = set(int(k) for k in current_members_map.keys())
             
             for e_id in (new_ids - old_ids):
-                await channel.send(f"🎉 **NOVO MEMBRO:** O jogador **{current_ids[e_id]}** entrou no clã **[{tag}]**!")
+                e_str = str(e_id)
+                new_name = current_members_map.get(e_str, "Jogador")
+                await channel.send(f"🎉 **NOVO MEMBRO:** O jogador **{new_name}** entrou no clã **[{tag}]**!")
+                
             for s_id in (old_ids - new_ids):
-                await channel.send(f"🚪 **SAÍDA:** Um jogador deixou o clã **[{tag}]**.")
+                s_str = str(s_id)
+                old_name = last_members_map.get(s_str, f"ID {s_id}")
+                await channel.send(f"🚪 **SAÍDA:** O jogador **{old_name}** deixou o clã **[{tag}]**.")
 
-        current_ids_str = ",".join(map(str, current_ids.keys()))
-        await update_last_members(g_id, current_ids_str)
+        await update_last_members(g_id, current_members_map)
         
         if config.get('channel_id') and config.get('panel_message_id') and channel:
             try:
@@ -554,8 +567,8 @@ async def painel(ctx):
     panel_msg = await ctx.send(embed=embed)
     await set_server_panel(ctx.guild.id, ctx.channel.id, panel_msg.id)
     
-    current_ids_str = ",".join(str(m['account_id']) for m in in_game_members)
-    await update_last_members(ctx.guild.id, current_ids_str)
+    current_members_map = {str(m['account_id']): m['account_name'] for m in in_game_members}
+    await update_last_members(ctx.guild.id, current_members_map)
     
     await send_inactivity_warning(ctx.guild, in_game_members)
 
