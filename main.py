@@ -181,7 +181,8 @@ async def fetch_clan_members(target_tag: str):
                     account_ids = list(members.keys())
                     acc_ids_str = ",".join(account_ids)
                     
-                    acc_info_url = f"{base_url}/wotb/account/info/?application_id={APPLICATION_ID}&account_id={acc_ids_str}&fields=last_battle_time,nickname"
+                    # Removido o filtro restritivo de fields para evitar falhas na API
+                    acc_info_url = f"{base_url}/wotb/account/info/?application_id={APPLICATION_ID}&account_id={acc_ids_str}"
                     
                     last_battle_dict = {}
                     real_nickname_dict = {}
@@ -197,7 +198,7 @@ async def fetch_clan_members(target_tag: str):
                                         real_nickname_dict[str(pid)] = pinfo['nickname']
 
                     now = now_br()
-                    one_month_ago = now - timedelta(days=30)
+                    three_weeks_ago = now - timedelta(days=21) # Limite de 3 semanas (21 dias)
                     
                     member_list = []
                     for m_id, m_info in members.items():
@@ -206,13 +207,13 @@ async def fetch_clan_members(target_tag: str):
                         role = m_info.get('role', '')
                         role_order, role_badge = get_role_info(role)
                         
-                        is_inactive_30d = False
+                        is_inactive_21d = False
                         if last_battle_ts > 0:
                             dt_last_battle = datetime.fromtimestamp(last_battle_ts, tz=TIMEZONE_BR)
-                            if dt_last_battle < one_month_ago:
-                                is_inactive_30d = True
+                            if dt_last_battle < three_weeks_ago:
+                                is_inactive_21d = True
                         else:
-                            is_inactive_30d = True
+                            is_inactive_21d = True
                             
                         member_list.append({
                             'account_id': m_info['account_id'],
@@ -221,7 +222,7 @@ async def fetch_clan_members(target_tag: str):
                             'role_order': role_order,
                             'role_badge': role_badge,
                             'raw_ts': last_battle_ts,
-                            'is_inactive_30d': is_inactive_30d
+                            'is_inactive_21d': is_inactive_21d
                         })
                     
                     member_list.sort(key=lambda x: (x['role_order'], -x['raw_ts']))
@@ -241,7 +242,7 @@ async def build_clan_embed(tag, in_game_members):
     
     em_ambos = []
     apenas_jogo = []
-    inativos_30d = []
+    inativos_21d = []
     
     for m in in_game_members:
         acc_id = m['account_id']
@@ -250,8 +251,8 @@ async def build_clan_embed(tag, in_game_members):
         role_badge = m['role_badge']
         time_str = format_ts_discord(ts)
         
-        if m['is_inactive_30d']:
-            inativos_30d.append(f"• **{acc_name}**{role_badge} ▫️ ⚠️ *Inativo (+30d)* ▫️ {time_str}")
+        if m['is_inactive_21d']:
+            inativos_21d.append(f"• **{acc_name}**{role_badge} ▫️ ⚠️ *Inativo (+21d)* ▫️ {time_str}")
         
         if acc_id in mappings:
             discord_list = mappings[acc_id]
@@ -264,7 +265,7 @@ async def build_clan_embed(tag, in_game_members):
         title=f"📋 Organização do Clã [{tag}]",
         description=(
             f"📊 **Resumo:** Total no Jogo: **{len(in_game_members)}** │ Vinculados: **{len(em_ambos)}** │ Pendentes: **{len(apenas_jogo)}**\n"
-            f"⚠️ **Inativos (+30 dias):** **{len(inativos_30d)}** membros\n"
+            f"⚠️ **Inativos (+21 dias / 3 semanas):** **{len(inativos_21d)}** membros\n"
             "───────────────────────────────"
         ),
         color=0x3498DB
@@ -292,8 +293,8 @@ async def build_clan_embed(tag, in_game_members):
 
     add_safe_fields(embed, "🟢 Presentes no Jogo E no Discord", em_ambos)
     add_safe_fields(embed, "🔴 Apenas no Clã do Jogo", apenas_jogo)
-    if inativos_30d:
-        add_safe_fields(embed, "⚠️ Inativos Há Mais de 30 Dias", inativos_30d)
+    if inativos_21d:
+        add_safe_fields(embed, "⚠️ Inativos Há Mais de 3 Semanas (21 Dias)", inativos_21d)
     
     embed.set_footer(text="Auto-atualiza de hora em hora • Horário de Brasília")
     embed.timestamp = now_br()
@@ -343,7 +344,7 @@ async def send_inactivity_warning(guild, in_game_members):
         return
 
     mappings = await get_all_mappings()
-    inactives = [m for m in in_game_members if m['is_inactive_30d']]
+    inactives = [m for m in in_game_members if m['is_inactive_21d']]
     
     if not inactives:
         return
@@ -357,14 +358,14 @@ async def send_inactivity_warning(guild, in_game_members):
         if acc_id in mappings:
             discord_list = mappings[acc_id]
             mentions_str = " ".join(f"<@{d['discord_id']}>" for d in discord_list)
-            msg = f"⚠️ {mentions_str} Você está há mais de **30 dias sem jogar**. Por favor, faça ao menos uma batalha REGULAR no WOTB para manter o seu registro ativo!"
+            msg = f"⚠️ {mentions_str} Você está há mais de **3 semanas (21 dias) sem jogar**. Por favor, faça ao menos uma batalha REGULAR no WOTB para manter o seu registro ativo!"
             await absent_channel.send(msg)
         else:
             unlinked_inactives.append(acc_name)
 
     if unlinked_inactives:
         list_str = ", ".join(f"**{nick}**" for nick in unlinked_inactives)
-        await absent_channel.send(f"⚠️ **Jogadores inativos (+30 dias) sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular NICK` para registrá-los)*")
+        await absent_channel.send(f"⚠️ **Jogadores inativos (+21 dias / 3 semanas) sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular NICK` para registrá-los)*")
 
 # --- 5. TAREFAS AUTOMÁTICAS ---
 
@@ -426,6 +427,11 @@ async def auto_update_job():
                 await channel.send(f"🚪 **SAÍDA:** O jogador **{old_name}** deixou o clã **[{tag}]**.")
 
         await update_last_members(g_id, current_members_map)
+        
+        # Envia alertas automáticos de inatividade para o canal configurado
+        guild = bot.get_guild(g_id)
+        if guild and config.get('absent_channel_id'):
+            await send_inactivity_warning(guild, in_game_members)
         
         if config.get('channel_id') and config.get('panel_message_id') and channel:
             try:
@@ -502,7 +508,7 @@ async def ajuda(ctx):
             "• `!atual` ➔ Atualiza manualmente todas as tabelas, dados e painéis do clã.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
-            "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
+            "• `!setausentes #canal` ➔ Alertas de ausentes (>21d / 3 semanas).\n"
             "• `!vinculados` ➔ Lista todas as contas vinculadas.\n"
             "• `!pendentes` ➔ Lista quem falta se vincular.\n"
             "• `!desvincular @membro` ➔ Remove vinculação."
@@ -530,7 +536,7 @@ async def setcla(ctx, tag: str):
             "• `!atual` ➔ Atualiza manualmente todas as tabelas, dados e painéis do clã.\n"
             "• `!painel` ➔ Painel fixo do clã (auto-atualiza a cada 1 hora).\n"
             "• `!painelonline` ➔ Painel de atividade recente (auto-atualiza a cada 5 min).\n"
-            "• `!setausentes #canal` ➔ Alertas de ausentes (>30d).\n"
+            "• `!setausentes #canal` ➔ Alertas de ausentes (>21d / 3 semanas).\n"
             "• `!vinculados` ➔ Lista todas as contas vinculadas.\n"
             "• `!pendentes` ➔ Lista quem falta se vincular.\n"
             "• `!desvincular @membro` ➔ Remove vinculação."
@@ -559,7 +565,6 @@ async def atual(ctx):
 
     mappings = await get_all_mappings()
 
-    # Atualiza nicks caso tenham mudado e avisa no chat
     for m in in_game_members:
         acc_id = m['account_id']
         current_nick = m['account_name']
@@ -572,7 +577,6 @@ async def atual(ctx):
                     f"✏️ **TROCA DE NICK DETECTADA:** O membro alterou o seu nick de `{old_nick}` para **`{current_nick}`**!"
                 )
 
-    # Verifica saídas e entradas comparando com os dados salvos anteriormente e avisa no chat
     current_members_map = {str(m['account_id']): m['account_name'] for m in in_game_members}
     last_members_data = config.get('last_members')
     
@@ -598,10 +602,11 @@ async def atual(ctx):
             old_name = last_members_map.get(s_str, f"ID {s_id}")
             await ctx.send(f"🚪 **SAÍDA:** O jogador **{old_name}** deixou o clã **[{tag}]**.")
 
-    # Atualiza o registro dos membros atuais no banco
     await update_last_members(ctx.guild.id, current_members_map)
 
-    # Atualiza o painel principal se configurado
+    # Dispara avisos de ausentes manualmente se configurado
+    await send_inactivity_warning(ctx.guild, in_game_members)
+
     if config.get('channel_id') and config.get('panel_message_id'):
         try:
             panel_channel = bot.get_channel(config['channel_id']) or ctx.channel
@@ -611,7 +616,6 @@ async def atual(ctx):
         except Exception as e:
             print(f"Erro ao atualizar painel principal no !atual: {e}")
 
-    # Atualiza o painel online se configurado
     if config.get('channel_id') and config.get('online_panel_message_id'):
         try:
             online_channel = bot.get_channel(config['channel_id']) or ctx.channel
@@ -621,13 +625,13 @@ async def atual(ctx):
         except Exception as e:
             print(f"Erro ao atualizar painel online no !atual: {e}")
 
-    await loading_msg.edit(content="✅ **Todas as tabelas, dados e painéis foram atualizados com sucesso!**")
+    await loading_msg.edit(content="✅ **Todas as tabelas, dados, alertas e painéis foram atualizados com sucesso!**")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setausentes(ctx, channel: discord.TextChannel):
     await set_absent_channel(ctx.guild.id, channel.id)
-    await ctx.send(f"✅ **Canal de ausentes definido para:** {channel.mention}")
+    await ctx.send(f"✅ **Canal de ausentes definido para:** {channel.mention}\n*(Os alertas automáticos de membros inativos há mais de 3 semanas / 21 dias serão enviados aqui).*")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -682,7 +686,6 @@ async def painelonline(ctx):
 
 @bot.command()
 async def vincular(ctx, *, nick_jogo: str = None):
-    """Vincula o nick do WOTB, permitindo até 2 contas por usuário do Discord e vice-versa."""
     if not nick_jogo:
         await ctx.send("⚠️ **Uso incorreto!** Digite o seu nick do jogo junto com o comando.\nExemplo: `!vincular 2pende`")
         return
