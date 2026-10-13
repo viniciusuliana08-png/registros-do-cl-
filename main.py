@@ -181,7 +181,6 @@ async def fetch_clan_members(target_tag: str):
                     account_ids = list(members.keys())
                     acc_ids_str = ",".join(account_ids)
                     
-                    # Removido o filtro restritivo de fields para evitar falhas na API
                     acc_info_url = f"{base_url}/wotb/account/info/?application_id={APPLICATION_ID}&account_id={acc_ids_str}"
                     
                     last_battle_dict = {}
@@ -347,25 +346,52 @@ async def send_inactivity_warning(guild, in_game_members):
     inactives = [m for m in in_game_members if m['is_inactive_21d']]
     
     if not inactives:
+        if config.get('warned_inactives'):
+            await servers_col.update_one(
+                {"guild_id": guild.id},
+                {"$set": {"warned_inactives": []}}
+            )
         return
 
-    unlinked_inactives = []
+    warned_list = config.get('warned_inactives', [])
+    new_inactives_to_warn = []
+    current_inactive_ids = []
 
     for m in inactives:
-        acc_id = m['account_id']
-        acc_name = m['account_name']
-        
-        if acc_id in mappings:
-            discord_list = mappings[acc_id]
-            mentions_str = " ".join(f"<@{d['discord_id']}>" for d in discord_list)
-            msg = f"⚠️ {mentions_str} Você está há mais de **3 semanas (21 dias) sem jogar**. Por favor, faça ao menos uma batalha REGULAR no WOTB para manter o seu registro ativo!"
-            await absent_channel.send(msg)
-        else:
-            unlinked_inactives.append(acc_name)
+        acc_id_str = str(m['account_id'])
+        current_inactive_ids.append(acc_id_str)
+        if acc_id_str not in warned_list:
+            new_inactives_to_warn.append(m)
 
-    if unlinked_inactives:
-        list_str = ", ".join(f"**{nick}**" for nick in unlinked_inactives)
-        await absent_channel.send(f"⚠️ **Jogadores inativos (+21 dias / 3 semanas) sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular NICK` para registrá-los)*")
+    updated_warned_list = [w_id for w_id in warned_list if w_id in current_inactive_ids]
+
+    if new_inactives_to_warn:
+        unlinked_inactives = []
+
+        for m in new_inactives_to_warn:
+            acc_id = m['account_id']
+            acc_name = m['account_name']
+            acc_id_str = str(acc_id)
+            
+            if acc_id in mappings:
+                discord_list = mappings[acc_id]
+                mentions_str = " ".join(f"<@{d['discord_id']}>" for d in discord_list)
+                msg = f"⚠️ {mentions_str} Você está há mais de **3 semanas (21 dias) sem jogar**. Por favor, faça ao menos uma batalha REGULAR no WOTB para manter o seu registro ativo!"
+                await absent_channel.send(msg)
+            else:
+                unlinked_inactives.append(acc_name)
+            
+            if acc_id_str not in updated_warned_list:
+                updated_warned_list.append(acc_id_str)
+
+        if unlinked_inactives:
+            list_str = ", ".join(f"**{nick}**" for nick in unlinked_inactives)
+            await absent_channel.send(f"⚠️ **Jogadores inativos (+21 dias / 3 semanas) sem vínculo no Discord:**\n{list_str}\n*(Use `!vincular NICK` para registrá-los)*")
+
+    await servers_col.update_one(
+        {"guild_id": guild.id},
+        {"$set": {"warned_inactives": updated_warned_list}}
+    )
 
 # --- 5. TAREFAS AUTOMÁTICAS ---
 
@@ -428,7 +454,6 @@ async def auto_update_job():
 
         await update_last_members(g_id, current_members_map)
         
-        # Envia alertas automáticos de inatividade para o canal configurado
         guild = bot.get_guild(g_id)
         if guild and config.get('absent_channel_id'):
             await send_inactivity_warning(guild, in_game_members)
@@ -604,7 +629,7 @@ async def atual(ctx):
 
     await update_last_members(ctx.guild.id, current_members_map)
 
-    # Dispara avisos de ausentes manualmente se configurado
+    # Dispara avisos de ausentes manualmente se configurado (respeitando o envio único)
     await send_inactivity_warning(ctx.guild, in_game_members)
 
     if config.get('channel_id') and config.get('panel_message_id'):
@@ -631,7 +656,7 @@ async def atual(ctx):
 @commands.has_permissions(administrator=True)
 async def setausentes(ctx, channel: discord.TextChannel):
     await set_absent_channel(ctx.guild.id, channel.id)
-    await ctx.send(f"✅ **Canal de ausentes definido para:** {channel.mention}\n*(Os alertas automáticos de membros inativos há mais de 3 semanas / 21 dias serão enviados aqui).*")
+    await ctx.send(f"✅ **Canal de ausentes definido para:** {channel.mention}\n*(Os alertas automáticos de membros inativos há mais de 3 semanas / 21 dias serão enviados aqui apenas uma vez por período).*")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
